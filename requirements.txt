@@ -1,0 +1,8 @@
+Pillow>=10.0.0
+numpy>=1.23.0,<2.0.0; platform_system == "Darwin" and platform_machine == "x86_64"
+torch==2.2.2; platform_system == "Darwin" and platform_machine == "x86_64"
+torch>=2.2.0; platform_system != "Darwin" or platform_machine != "x86_64"
+torchvision==0.17.2; platform_system == "Darwin" and platform_machine == "x86_64"
+torchvision>=0.17.0; platform_system != "Darwin" or platform_machine != "x86_64"
+ultralytics>=8.4.7,<8.5
+findetection-core[mps] @ git+https://github.com/P4ul-A/FinDetection-MPS-Core.git@v0.3.0
