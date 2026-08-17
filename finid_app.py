@@ -19,13 +19,21 @@ from finid.models import (
     discover_detection_models,
     discover_identification_models,
 )
-from finid.pipeline import PipelineConfig, PipelineSummary, recommended_batches, run_pipeline
+from finid.pipeline import (
+    PipelineConfig,
+    PipelineSummary,
+    detector_has_finsaddle_classes,
+    recommended_batches,
+    run_pipeline,
+)
 
 
 APP_DIR = Path(__file__).resolve().parent
 DETECTION_MODELS_DIR = APP_DIR / "model_recognition"
 IDENTIFICATION_MODELS_DIR = APP_DIR / "model_identification"
 LOGO_PATH = APP_DIR / "assets" / "logo_orca.png"
+LOGO_FRAME_SIZE = (166, 124)
+LOGO_SUBSAMPLE = 2
 
 
 class FinIdentificationApp:
@@ -47,15 +55,20 @@ class FinIdentificationApp:
         self.class_cache: dict[Path, tuple[DetectionClass, ...]] = {}
         self.current_classes: tuple[DetectionClass, ...] = ()
         self.last_report: Path | None = None
+        self.last_reports_root: Path | None = None
+        self.last_report_count = 0
         recommendation = recommended_batches()
 
         pictures = Path.home() / "Pictures"
         self.input_var = tk.StringVar(value=str(pictures if pictures.is_dir() else Path.home()))
+        self.output_var = tk.StringVar(value="")
+        self.clustering_var = tk.BooleanVar(value=False)
         self.detector_var = tk.StringVar()
         self.identifier_var = tk.StringVar()
-        self.threshold_var = tk.DoubleVar(value=0.5)
+        self.threshold_var = tk.DoubleVar(value=0.7)
         self.threshold_help_var = tk.StringVar(value="Minimum identification score")
-        self.detector_confidence_var = tk.DoubleVar(value=0.25)
+        self.detector_confidence_var = tk.DoubleVar(value=0.5)
+        self.eye_confidence_var = tk.DoubleVar(value=0.5)
         self.image_size_var = tk.IntVar(value=1280)
         self.detector_batch_var = tk.IntVar(value=recommendation.detector_batch)
         self.identifier_batch_var = tk.IntVar(value=recommendation.identifier_batch)
@@ -166,8 +179,8 @@ class FinIdentificationApp:
         ).grid(row=1, column=0, sticky="w")
         logo_frame = tk.Frame(
             header,
-            width=120,
-            height=92,
+            width=LOGO_FRAME_SIZE[0],
+            height=LOGO_FRAME_SIZE[1],
             bg=self.colors["bg"],
             borderwidth=0,
             highlightthickness=0,
@@ -181,7 +194,10 @@ class FinIdentificationApp:
         )
         logo_frame.grid_propagate(False)
         try:
-            self.logo_photo = tk.PhotoImage(file=str(LOGO_PATH)).subsample(3, 3)
+            self.logo_photo = tk.PhotoImage(file=str(LOGO_PATH)).subsample(
+                LOGO_SUBSAMPLE,
+                LOGO_SUBSAMPLE,
+            )
             tk.Label(
                 logo_frame,
                 image=self.logo_photo,
@@ -200,19 +216,19 @@ class FinIdentificationApp:
         )
         self._path_row(setup, 1)
         ttk.Label(setup, text="Fin recognition model", style="Body.TLabel").grid(
-            row=2, column=0, sticky="w", pady=7
+            row=3, column=0, sticky="w", pady=7
         )
         self.detector_combo = ttk.Combobox(
             setup, textvariable=self.detector_var, state="disabled"
         )
-        self.detector_combo.grid(row=2, column=1, columnspan=2, sticky="ew", pady=7)
+        self.detector_combo.grid(row=3, column=1, columnspan=2, sticky="ew", pady=7)
         self.detector_combo.bind("<<ComboboxSelected>>", self._detector_changed)
         self.detector_combo.bind("<KeyRelease>", self._detector_changed)
-        ttk.Label(setup, text="Objects to identify", style="Body.TLabel").grid(
-            row=3, column=0, sticky="nw", pady=7
+        ttk.Label(setup, text="Detector objects (FinSaddle IDs)", style="Body.TLabel").grid(
+            row=4, column=0, sticky="nw", pady=7
         )
         object_frame = ttk.Frame(setup, style="Panel.TFrame")
-        object_frame.grid(row=3, column=1, columnspan=2, sticky="ew", pady=7)
+        object_frame.grid(row=4, column=1, columnspan=2, sticky="ew", pady=7)
         object_frame.columnconfigure(0, weight=1)
         self.object_list = tk.Listbox(
             object_frame,
@@ -246,16 +262,16 @@ class FinIdentificationApp:
         )
         self.clear_button.grid(row=1, column=2, sticky="ew", padx=(8, 0))
         ttk.Label(setup, text="Fin identification model", style="Body.TLabel").grid(
-            row=4, column=0, sticky="w", pady=7
+            row=5, column=0, sticky="w", pady=7
         )
         self.identifier_combo = ttk.Combobox(
             setup, textvariable=self.identifier_var, state="disabled"
         )
-        self.identifier_combo.grid(row=4, column=1, columnspan=2, sticky="ew", pady=7)
+        self.identifier_combo.grid(row=5, column=1, columnspan=2, sticky="ew", pady=7)
         self.identifier_combo.bind("<<ComboboxSelected>>", self._identifier_changed)
         self.identifier_combo.bind("<KeyRelease>", self._identifier_changed)
         ttk.Label(setup, text="Good identification threshold", style="Body.TLabel").grid(
-            row=5, column=0, sticky="w", pady=7
+            row=6, column=0, sticky="w", pady=7
         )
         threshold = ttk.Spinbox(
             setup,
@@ -265,9 +281,9 @@ class FinIdentificationApp:
             textvariable=self.threshold_var,
             width=10,
         )
-        threshold.grid(row=5, column=1, sticky="w", pady=7)
+        threshold.grid(row=6, column=1, sticky="w", pady=7)
         ttk.Label(setup, textvariable=self.threshold_help_var, style="Muted.TLabel").grid(
-            row=5, column=2, sticky="w", padx=(10, 0)
+            row=6, column=2, sticky="w", padx=(10, 0)
         )
 
         self.advanced_button = ttk.Button(
@@ -276,7 +292,7 @@ class FinIdentificationApp:
             command=self._toggle_advanced,
             style="Tool.TButton",
         )
-        self.advanced_button.grid(row=6, column=0, columnspan=3, sticky="w", pady=(9, 0))
+        self.advanced_button.grid(row=7, column=0, columnspan=3, sticky="w", pady=(9, 0))
         self.advanced = ttk.Frame(setup, style="Panel.TFrame")
         self._build_advanced(self.advanced)
 
@@ -293,7 +309,7 @@ class FinIdentificationApp:
         self.start_button.grid(row=0, column=0, rowspan=2, sticky="w")
         self.open_button = ttk.Button(
             controls,
-            text="Open root report",
+            text="Open reports",
             command=self.open_report,
             state="disabled",
             style="Tool.TButton",
@@ -362,9 +378,24 @@ class FinIdentificationApp:
             parent, text="Browse…", command=self._browse, style="Tool.TButton"
         ).grid(row=row, column=2, pady=7)
 
+        ttk.Checkbutton(
+            parent,
+            text="Copy images into encounter clusters",
+            variable=self.clustering_var,
+            command=self._sync_output_controls,
+        ).grid(row=row + 1, column=0, sticky="w", pady=7)
+        self.output_entry = ttk.Entry(parent, textvariable=self.output_var, state="disabled")
+        self.output_entry.grid(row=row + 1, column=1, sticky="ew", pady=7, padx=(0, 8))
+        self.output_button = ttk.Button(
+            parent, text="Output…", command=self._browse_output,
+            style="Tool.TButton", state="disabled",
+        )
+        self.output_button.grid(row=row + 1, column=2, pady=7)
+
     def _build_advanced(self, parent: ttk.Frame) -> None:
         labels = (
-            ("Detection confidence", self.detector_confidence_var, 0.01, 0, 1),
+            ("Fin / FinSaddle confidence", self.detector_confidence_var, 0.01, 0, 1),
+            ("Eye confidence", self.eye_confidence_var, 0.01, 0, 1),
             ("Detector image size", self.image_size_var, 32, 32, 4096),
             ("Detector batch", self.detector_batch_var, 1, 1, 128),
             ("Identifier batch", self.identifier_batch_var, 1, 1, 256),
@@ -391,7 +422,7 @@ class FinIdentificationApp:
     def _toggle_advanced(self) -> None:
         self.advanced_visible = not self.advanced_visible
         if self.advanced_visible:
-            self.advanced.grid(row=7, column=0, columnspan=3, sticky="w", pady=(12, 0))
+            self.advanced.grid(row=8, column=0, columnspan=3, sticky="w", pady=(12, 0))
             self.advanced_button.configure(text="Hide advanced settings ▴")
         else:
             self.advanced.grid_remove()
@@ -404,6 +435,29 @@ class FinIdentificationApp:
         )
         if selected:
             self.input_var.set(selected)
+
+    def _browse_output(self) -> None:
+        """Choose the root used for clustered encounter output.
+
+        Returns:
+            None.
+        """
+        selected = filedialog.askdirectory(
+            title="Choose an empty or FinIdentification-managed output folder",
+            initialdir=self.output_var.get() or str(Path.home()),
+        )
+        if selected:
+            self.output_var.set(selected)
+
+    def _sync_output_controls(self) -> None:
+        """Enable output controls only when clustering is selected.
+
+        Returns:
+            None.
+        """
+        state = "normal" if self.clustering_var.get() and not self.running else "disabled"
+        self.output_entry.configure(state=state)
+        self.output_button.configure(state=state)
 
     def _discover_models(self) -> None:
         detectors, detector_warnings = discover_detection_models(DETECTION_MODELS_DIR)
@@ -640,6 +694,8 @@ class FinIdentificationApp:
         except (OSError, ValueError, tk.TclError) as exc:
             messagebox.showerror("Check the settings", str(exc))
             return
+        if not self._confirm_clustering_compatibility(config):
+            return
         self.running = True
         self.stop_event.clear()
         self.last_report = None
@@ -660,6 +716,31 @@ class FinIdentificationApp:
             daemon=True,
         )
         self.worker.start()
+
+    def _confirm_clustering_compatibility(self, config: PipelineConfig) -> bool:
+        """Warn before clustering with a detector that has no saddle classes.
+
+        Parameters:
+            config: Validated configuration about to be started.
+
+        Returns:
+            ``True`` when the run may proceed, or ``False`` when cancelled.
+        """
+        if not config.clustering or detector_has_finsaddle_classes(
+            config.detector_classes
+        ):
+            return True
+        return bool(
+            messagebox.askokcancel(
+                "No FinSaddle classes in detector",
+                "Clustering is enabled, but this detector model has no "
+                "FinSaddle or saddle classes.\n\n"
+                "The IDed and FinSaddle folders will remain empty. Plain fin "
+                "detections will go to Rest; qualifying eyes can still go to "
+                "Eyes.\n\nContinue with this run?",
+                icon="warning",
+            )
+        )
 
     def _config(self) -> PipelineConfig:
         input_text = self.input_var.get().strip()
@@ -695,6 +776,14 @@ class FinIdentificationApp:
             identifier=identifier,
             threshold=float(self.threshold_var.get()),
             detector_confidence=float(self.detector_confidence_var.get()),
+            eye_confidence=float(self.eye_confidence_var.get()),
+            clustering=bool(self.clustering_var.get()),
+            output_root=(
+                Path(self.output_var.get()).expanduser().resolve()
+                if self.output_var.get().strip()
+                else None
+            ),
+            detector_classes=self.current_classes,
             detector_image_size=int(self.image_size_var.get()),
             detector_batch_size=int(self.detector_batch_var.get()),
             identifier_batch_size=int(self.identifier_batch_var.get()),
@@ -708,6 +797,7 @@ class FinIdentificationApp:
         self.detector_combo.configure(state=state)
         self.identifier_combo.configure(state=state)
         self._update_class_controls()
+        self._sync_output_controls()
 
     def _run(self, config: PipelineConfig) -> None:
         summary = run_pipeline(
@@ -790,7 +880,22 @@ class FinIdentificationApp:
                 self.progress_bar.stop()
                 self.progress_bar.configure(mode="determinate")
                 self.progress_value.set(current / total * 100)
-                self.status_var.set("Identifying fins…")
+                if self.running:
+                    folded = label.casefold()
+                    if "publish" in folded:
+                        self.status_var.set("Publishing output…")
+                    elif (
+                        "copying" in folded
+                        or "staged" in folded
+                        or "cluster staging" in folded
+                    ):
+                        self.status_var.set("Finalizing: copying clusters…")
+                    elif "report" in folded or "thumbnail" in folded:
+                        self.status_var.set("Finalizing: writing reports…")
+                    elif "inventory" in folded or "loading" in folded:
+                        self.status_var.set("Preparing inference…")
+                    else:
+                        self.status_var.set("Detecting and identifying…")
             self.progress_text_var.set(label)
         self.root.after(100, self._poll_events)
 
@@ -803,10 +908,17 @@ class FinIdentificationApp:
         self._set_inputs_enabled(True)
         self.start_button.configure(text="Start identification", state="normal")
         self.last_report = summary.root_report if summary.root_report.is_file() else None
-        self.open_button.configure(state="normal" if self.last_report else "disabled")
-        self.progress_value.set(
-            (summary.processed / summary.total * 100) if summary.total else 100
+        self.last_reports_root = summary.reports_root if summary.report_count else None
+        self.last_report_count = summary.report_count
+        self.open_button.configure(state="normal" if self.last_reports_root else "disabled")
+        self.open_button.configure(
+            text=(
+                "Open report"
+                if summary.report_count == 1
+                else "Open reports/output folder"
+            )
         )
+        self.progress_value.set(100)
         if summary.error:
             self.status_var.set("Finished with a problem")
             messagebox.showerror(
@@ -819,7 +931,8 @@ class FinIdentificationApp:
             self.status_var.set("Complete; reports are ready")
         self.progress_text_var.set(
             f"{summary.processed}/{summary.total} images · "
-            f"{summary.report_count} reports · "
+            f"{summary.encounter_count} encounters · {summary.report_count} reports · "
+            f"{summary.skipped_undated_count} undated skipped · "
             f"batches {summary.detector_batch_size}/{summary.identifier_batch_size}"
         )
 
@@ -832,10 +945,16 @@ class FinIdentificationApp:
         self.log_box.configure(state="disabled")
 
     def open_report(self) -> None:
-        """Open the most recent root report in the default browser."""
+        """Open one report or the reports/output folder for multiple encounters."""
 
-        if self.last_report and self.last_report.is_file():
+        if (
+            self.last_report_count == 1
+            and self.last_report
+            and self.last_report.is_file()
+        ):
             webbrowser.open(self.last_report.as_uri())
+        elif self.last_reports_root and self.last_reports_root.exists():
+            webbrowser.open(self.last_reports_root.as_uri())
 
     def on_close(self) -> None:
         """Close immediately or stop active work before closing."""

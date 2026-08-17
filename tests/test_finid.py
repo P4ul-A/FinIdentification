@@ -6,7 +6,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 
 import torch
 from PIL import Image
@@ -23,6 +23,7 @@ from finid.models import (
 )
 from finid.pipeline import (
     PipelineConfig,
+    discover_encounters,
     inventory_tree,
     iter_jpegs,
     recommended_batches,
@@ -211,6 +212,33 @@ class AppInputTests(unittest.TestCase):
 
         self.assertEqual(app._selected_class_ids(), (2, 7))
 
+    def test_clustering_without_saddle_classes_requires_confirmation(self) -> None:
+        app = FinIdentificationApp.__new__(FinIdentificationApp)
+        config = SimpleNamespace(
+            clustering=True,
+            detector_classes=(DetectionClass(0, "fin_left", "Fin Left"),),
+        )
+
+        with patch("finid_app.messagebox.askokcancel", return_value=False) as warning:
+            self.assertFalse(app._confirm_clustering_compatibility(config))
+
+        warning.assert_called_once()
+        self.assertIn("IDed and FinSaddle", warning.call_args.args[1])
+
+    def test_saddle_capable_model_does_not_show_clustering_warning(self) -> None:
+        app = FinIdentificationApp.__new__(FinIdentificationApp)
+        config = SimpleNamespace(
+            clustering=True,
+            detector_classes=(
+                DetectionClass(2, "finSaddle_right", "FinSaddle Right"),
+            ),
+        )
+
+        with patch("finid_app.messagebox.askokcancel") as warning:
+            self.assertTrue(app._confirm_clustering_compatibility(config))
+
+        warning.assert_not_called()
+
 
 class DiscoveryTests(unittest.TestCase):
     def test_discovers_arcface_and_resnet_and_skips_gallery(self) -> None:
@@ -272,7 +300,7 @@ class DiscoveryTests(unittest.TestCase):
 class InventoryAndReportTests(unittest.TestCase):
     def test_large_inventory_is_disk_backed_and_lazy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Large"
+            root = Path(temporary) / "2026-01-01 Large"
             root.mkdir()
             for index in range(2000):
                 (root / f"{index:05d}.jpg").touch()
@@ -285,7 +313,7 @@ class InventoryAndReportTests(unittest.TestCase):
 
     def test_inventory_reports_cooperative_scan_progress(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Scan"
+            root = Path(temporary) / "2026-01-01 Scan"
             (root / "Child").mkdir(parents=True)
             for index in range(5):
                 (root / f"{index}.jpg").touch()
@@ -305,7 +333,7 @@ class InventoryAndReportTests(unittest.TestCase):
 
     def test_inventory_is_recursive_and_ignores_generated_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Trip"
+            root = Path(temporary) / "2026-01-01 Trip"
             child = root / "Day 1"
             child.mkdir(parents=True)
             (root / ".DS_Store").write_bytes(b"metadata")
@@ -322,13 +350,12 @@ class InventoryAndReportTests(unittest.TestCase):
             with ResultStore() as store:
                 total = inventory_tree(root, store)
                 self.assertEqual(total, 2)
-                self.assertEqual(store.directory_count(), 2)
-                self.assertEqual(list(store.skipped_files(root)), ["notes.txt"])
+                self.assertEqual(store.encounter_count(), 1)
                 self.assertEqual([path.name for path in iter_jpegs(root)], ["A.JPG", "B.jpeg"])
 
     def test_report_name_content_navigation_and_no_image_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tur med øre"
+            root = Path(temporary) / "2026-01-01 Tur med øre"
             child = root / "Day #1"
             child.mkdir(parents=True)
             source = child / "orca one.jpg"
@@ -338,7 +365,30 @@ class InventoryAndReportTests(unittest.TestCase):
                 inventory_tree(root, store)
                 store.record_result(
                     source,
-                    1,
+                    [
+                        {
+                            "class_id": 0,
+                            "class_name": "fin_left",
+                            "side": "LEFT",
+                            "confidence": 0.88,
+                            "selected": True,
+                            "x1": 1,
+                            "y1": 2,
+                            "x2": 30,
+                            "y2": 20,
+                        },
+                        {
+                            "class_id": 1,
+                            "class_name": "fin_right",
+                            "side": "RIGHT",
+                            "confidence": 0.84,
+                            "selected": True,
+                            "x1": 20,
+                            "y1": 10,
+                            "x2": 38,
+                            "y2": 28,
+                        },
+                    ],
                     [
                         {
                             "identity": "NKW-001 & friend",
@@ -349,6 +399,7 @@ class InventoryAndReportTests(unittest.TestCase):
                             "y1": 2,
                             "x2": 30,
                             "y2": 20,
+                            "detection_index": 0,
                         },
                         {
                             "identity": "NKW-002",
@@ -359,8 +410,11 @@ class InventoryAndReportTests(unittest.TestCase):
                             "y1": 10,
                             "x2": 38,
                             "y2": 28,
+                            "detection_index": 1,
                         }
                     ],
+                    "IDed",
+                    "LEFT",
                 )
                 count = write_reports(
                     store,
@@ -375,27 +429,25 @@ class InventoryAndReportTests(unittest.TestCase):
                         throughput=0.5,
                     ),
                 )
-            self.assertEqual(count, 2)
-            root_report = root / "FinID_Tur med øre.html"
-            child_report = child / "FinID_Day #1.html"
+            self.assertEqual(count, 1)
+            root_report = root / "FinID_2026-01-01 Tur med øre.html"
+            child_report = root_report
             self.assertTrue(root_report.is_file())
             text = child_report.read_text(encoding="utf-8")
             self.assertIn("NKW-001 &amp; friend", text)
             self.assertIn("NKW-002", text)
             self.assertIn("orca%20one.jpg", text)
-            self.assertIn("FinID_Tur%20med%20%C3%B8re.html", text)
+            self.assertIn("Original:", text)
             self.assertEqual(text.count('class="box"'), 2)
             self.assertIn("--box-color:#0369a1", text)
             self.assertIn("--box-color:#b45309", text)
-            self.assertIn('style="color:#0369a1"', text)
-            self.assertIn('style="color:#b45309"', text)
             self.assertNotIn("box (1, 2)", text)
             self.assertNotIn("Detection 88.0%", text)
             self.assertNotIn("0 0 0 1px", text)
             self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), original_hash)
             self.assertEqual(
                 sorted(path.name for path in child.iterdir()),
-                ["FinID_Day #1.html", "orca one.jpg"],
+                ["orca one.jpg"],
             )
 
 
@@ -403,7 +455,7 @@ class PipelineTests(unittest.TestCase):
     def test_pipeline_uses_selected_class_and_writes_accepted_only_reports(self) -> None:
         detector, identifier = descriptors()
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Encounter"
+            root = Path(temporary) / "2026-01-01 Encounter"
             child = root / "Camera A"
             child.mkdir(parents=True)
             accepted = child / "accepted.jpg"
@@ -428,6 +480,10 @@ class PipelineTests(unittest.TestCase):
                     threshold=0.8,
                     detector_batch_size=2,
                     identifier_batch_size=8,
+                    detector_classes=(
+                        DetectionClass(0, "finSaddle_left", "FinSaddle Left"),
+                        DetectionClass(1, "eye_right", "Eye Right"),
+                    ),
                     selected_class_ids=(0,),
                 ),
                 runtime=runtime,
@@ -436,18 +492,17 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertTrue(summary.completed)
             self.assertEqual(summary.processed, 2)
-            self.assertEqual(summary.report_count, 2)
-            report = child / report_filename(child)
+            self.assertEqual(summary.report_count, 1)
+            report = root / report_filename(root)
             text = report.read_text(encoding="utf-8")
             self.assertIn("accepted.jpg", text)
-            self.assertNotIn("rejected.jpeg</strong>", text)
-            self.assertIn("video.mov", text)
-            self.assertIn(">2</strong>Selected objects", text)
+            self.assertIn("rejected.jpeg", text)
+            self.assertIn("Destination: FinSaddle", text)
 
     def test_pipeline_can_use_a_nonzero_model_class(self) -> None:
         detector, identifier = descriptors()
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Encounter"
+            root = Path(temporary) / "2026-01-01 Encounter"
             root.mkdir()
             source = root / "objects.jpg"
             Image.new("RGB", (100, 80), "white").save(source)
@@ -465,6 +520,10 @@ class PipelineTests(unittest.TestCase):
                     root,
                     detector,
                     identifier,
+                    detector_classes=(
+                        DetectionClass(0, "fin_left", "Fin Left"),
+                        DetectionClass(1, "finSaddle_right", "FinSaddle Right"),
+                    ),
                     selected_class_ids=(1,),
                 ),
                 runtime=runtime,
@@ -474,7 +533,7 @@ class PipelineTests(unittest.TestCase):
 
             self.assertTrue(summary.completed)
             text = (root / report_filename(root)).read_text(encoding="utf-8")
-            self.assertIn(">1</strong>Selected objects", text)
+            self.assertIn("finSaddle_right 0.900", text)
             self.assertIn("left:70.0000%", text)
 
     def test_pipeline_config_rejects_an_empty_explicit_selection(self) -> None:
@@ -491,7 +550,7 @@ class PipelineTests(unittest.TestCase):
     def test_empty_tree_still_gets_reports_without_loading_models(self) -> None:
         detector, identifier = descriptors()
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Empty"
+            root = Path(temporary) / "2026-01-01 Empty"
             (root / "Child").mkdir(parents=True)
             summary = run_pipeline(
                 PipelineConfig(root, detector, identifier),
@@ -501,12 +560,12 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertTrue(summary.completed)
             self.assertEqual(summary.total, 0)
-            self.assertEqual(summary.report_count, 2)
+            self.assertEqual(summary.report_count, 1)
 
     def test_pre_stopped_run_writes_partial_reports(self) -> None:
         detector, identifier = descriptors()
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Stopped"
+            root = Path(temporary) / "2026-01-01 Stopped"
             root.mkdir()
             Image.new("RGB", (40, 40)).save(root / "one.jpg")
             event = threading.Event()

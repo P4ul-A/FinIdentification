@@ -12,22 +12,40 @@ read and copied.
 
 ## Workflow
 
-1. Choose the root folder containing `.jpg` or `.jpeg` images.
+1. Choose a tree containing date-prefixed encounter folders such as
+   `2026-08-17 Survey`, or choose one dated encounter directly.
 2. Choose the detection model, then select one or more model-derived object
-   classes whose crops should be passed to identification. All are selected
+   classes. Selected FinSaddle classes are eligible for identification; plain
+   fin classes are recorded but currently go to Rest. All classes are selected
    whenever the model changes.
 3. Choose the fin-identification model and set the minimum score required for
    a good identification.
-4. Select **Start identification**.
+4. Optionally enable clustering and choose a separate empty output folder.
+   A previous output can be rebuilt only when it contains the app's
+   `.finid-managed` marker.
+5. Set the identification, Fin/FinSaddle, and eye confidence thresholds, then
+   select **Start identification**.
 
-Every scanned directory receives a report named
-`FinID_<folder name>.html`. Reports contain accepted identifications and link
-to parent and child reports. Accepted fin boxes are drawn as colored browser
-overlays, with each identity name below the image shown in the matching color.
-Images are displayed from their original locations; they are never copied or
-changed. `.DS_Store` and existing
-`FinID_*.html` files are ignored, while other non-JPEG files are listed as
-skipped.
+The app creates exactly one `FinID_<encounter>.html` report per encounter.
+A dated folder containing only `ENCOUNTER*` child folders is split into those
+explicit encounters; nested trip, side, camera, and lone group folders remain
+part of their owning encounter. When an encounter contains sibling `GROUP*`
+directories such as `GROUP1` and `GROUP2`, each group becomes its own encounter
+and receives its own output tree and report. JPEGs without a dated encounter ancestor are
+skipped before inference and counted in the run summary.
+
+Reports begin with identified images grouped by their highest-scoring identity,
+then show FinSaddle, Eyes, and Rest. Cards include source and copied paths,
+assignment, side, identity and detector scores, and detection overlays. Without
+clustering, reports are written in source encounter roots and images stay in
+place. With clustering, the source hierarchy is mirrored only through each
+encounter root and each original is copied once into `LEFT`, `RIGHT`, or `Rest`.
+Original JPEGs are never moved or modified.
+
+Encounters with more than 500 images use a paged gallery. The report loads at
+most 100 cards at once from managed local data chunks and displays sequentially
+generated 480-pixel thumbnails, while each card continues to link to the full
+image. This keeps browser DOM and decoded-image memory bounded.
 
 ## Models
 
@@ -52,14 +70,21 @@ memory, beginning with detector/identifier batches of 2/8 on a 16 GB Mac.
 Higher-memory Macs receive larger batches. Both stages automatically halve
 their active batch after an MPS out-of-memory error.
 
-Paths and results are streamed, and run state is held in temporary SQLite
-storage, so steady-state memory does not grow with the number of images.
+Paths, detections, assignments, report grouping, and results are streamed
+through temporary SQLite storage, so steady-state memory does not grow with the
+number of images. The filesystem is scanned once; provisional paths and
+directory relationships are resolved into encounters on disk. FinSaddle crops
+are queued across source images into bounded identifier batches, and primary
+identities are indexed directly for report generation. Cluster trees are
+assembled in staging and swapped into place only after copying and report
+generation succeed.
 The class list comes directly from each detection model through the shared
-`FinDetection-MPS-Core` contract. Only selected, above-confidence detections
-are cropped in memory and passed to the identification model. No class IDs are
-hard-coded in finID. Core owns class metadata normalization, selection,
-confidence partitioning, and overlap suppression so every consuming app uses
-the same behavior.
+`FinDetection-MPS-Core` contract. Only selected, above-confidence FinSaddle
+detections are cropped in memory and passed to the identification
+model. No numeric class IDs are hard-coded in finID; encounter classification
+uses the model's class names and raw detector scores. Identification accepts
+FinSaddle crops only. Plain fin detections currently go to Rest and never to
+identification or the FinSaddle fallback category.
 
 ## Tests
 

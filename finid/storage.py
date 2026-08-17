@@ -1,4 +1,4 @@
-"""Temporary SQLite-backed run state for bounded-memory identification."""
+"""Temporary SQLite-backed state for encounter-aware identification runs."""
 
 from __future__ import annotations
 
@@ -10,314 +10,393 @@ from typing import Iterable, Iterator
 
 
 class ResultStore:
-    """Disk-backed run state so memory use does not grow with the image tree."""
+    """Keep inventory, detections, identities, and assignments on disk."""
+
+    COMMIT_INTERVAL = 500
 
     def __init__(self) -> None:
         handle, name = tempfile.mkstemp(prefix="finid-", suffix=".sqlite3")
         os.close(handle)
         self.path = Path(name)
+        self._writes_since_commit = 0
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(
             """
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
-            CREATE TABLE directories (
+            CREATE TABLE encounters (
+                path TEXT PRIMARY KEY, relative_path TEXT NOT NULL,
+                output_path TEXT, image_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE scan_directories (
                 path TEXT PRIMARY KEY,
                 parent_path TEXT,
-                jpeg_count INTEGER NOT NULL DEFAULT 0,
-                processed_count INTEGER NOT NULL DEFAULT 0,
-                detected_fins INTEGER NOT NULL DEFAULT 0,
-                accepted_images INTEGER NOT NULL DEFAULT 0,
-                rejected_images INTEGER NOT NULL DEFAULT 0,
-                failure_count INTEGER NOT NULL DEFAULT 0,
-                skipped_count INTEGER NOT NULL DEFAULT 0
+                name TEXT NOT NULL,
+                child_count INTEGER NOT NULL DEFAULT 0,
+                direct_jpeg_count INTEGER NOT NULL DEFAULT 0
             );
-            CREATE TABLE source_images (
+            CREATE INDEX scan_directories_parent ON scan_directories(parent_path);
+            CREATE TABLE scan_images (
                 path TEXT PRIMARY KEY,
                 directory_path TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                state TEXT NOT NULL DEFAULT 'pending'
-            );
-            CREATE INDEX source_images_directory ON source_images(directory_path);
-            CREATE TABLE skipped_files (
-                directory_path TEXT NOT NULL,
                 filename TEXT NOT NULL
             );
-            CREATE TABLE failures (
-                directory_path TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                message TEXT NOT NULL
+            CREATE TABLE source_images (
+                id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL,
+                encounter_path TEXT NOT NULL, relative_path TEXT NOT NULL,
+                filename TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+                cluster_category TEXT, cluster_side TEXT, copied_filename TEXT,
+                failure_message TEXT, primary_identity TEXT,
+                primary_identity_score REAL
             );
-            CREATE TABLE accepted_images (
-                id INTEGER PRIMARY KEY,
-                directory_path TEXT NOT NULL,
-                filename TEXT NOT NULL
+            CREATE INDEX source_images_encounter ON source_images(encounter_path);
+            CREATE INDEX source_images_reporting ON source_images(
+                encounter_path, state, cluster_category, relative_path COLLATE NOCASE
             );
-            CREATE INDEX accepted_images_directory ON accepted_images(directory_path);
-            CREATE TABLE accepted_fins (
-                image_id INTEGER NOT NULL,
-                identity TEXT NOT NULL,
-                score REAL NOT NULL,
-                score_type TEXT NOT NULL,
-                detection_confidence REAL NOT NULL,
-                x1 INTEGER NOT NULL,
-                y1 INTEGER NOT NULL,
-                x2 INTEGER NOT NULL,
-                y2 INTEGER NOT NULL
+            CREATE TABLE detections (
+                id INTEGER PRIMARY KEY, image_id INTEGER NOT NULL,
+                class_id INTEGER NOT NULL, class_name TEXT NOT NULL, side TEXT,
+                confidence REAL NOT NULL, selected INTEGER NOT NULL,
+                x1 INTEGER NOT NULL, y1 INTEGER NOT NULL,
+                x2 INTEGER NOT NULL, y2 INTEGER NOT NULL
             );
+            CREATE INDEX detections_image ON detections(image_id);
+            CREATE TABLE identities (
+                id INTEGER PRIMARY KEY, image_id INTEGER NOT NULL,
+                detection_id INTEGER, identity TEXT NOT NULL, score REAL NOT NULL,
+                score_type TEXT NOT NULL, UNIQUE(image_id, identity)
+            );
+            CREATE INDEX identities_image ON identities(image_id);
+            CREATE INDEX identities_ranked ON identities(
+                image_id, score DESC, identity
+            );
+            CREATE TABLE skipped_undated (path TEXT PRIMARY KEY);
             """
         )
 
-    def add_directory(self, path: Path, parent: Path | None) -> None:
-        """Add one discovered directory and optional parent."""
+    def _commit_periodically(self) -> None:
+        """Bound transaction size while avoiding a disk sync for every image."""
+        self._writes_since_commit += 1
+        if self._writes_since_commit >= self.COMMIT_INTERVAL:
+            self.commit()
 
+    def commit(self) -> None:
+        """Commit pending state changes and reset the write counter."""
+        self.connection.commit()
+        self._writes_since_commit = 0
+
+    def add_encounter(self, path: Path, relative_path: Path) -> None:
+        """Add an encounter and its mirrored path.
+
+        Parameters:
+            path: Absolute source encounter root.
+            relative_path: Mirrored path beneath the selected input root.
+
+        Returns:
+            None.
+        """
         self.connection.execute(
-            "INSERT OR IGNORE INTO directories(path, parent_path) VALUES (?, ?)",
-            (str(path), str(parent) if parent is not None else None),
+            "INSERT OR IGNORE INTO encounters(path, relative_path) VALUES (?, ?)",
+            (str(path.resolve()), relative_path.as_posix()),
         )
+        self._commit_periodically()
 
-    def add_image(self, path: Path) -> None:
-        """Add one pending source image and increment its directory count."""
-
+    def add_scanned_directory(self, path: Path, parent: Path | None) -> None:
+        """Record a directory found during the single filesystem scan."""
         self.connection.execute(
-            "INSERT INTO source_images(path, directory_path, filename) VALUES (?, ?, ?)",
+            """INSERT OR IGNORE INTO scan_directories(path, parent_path, name)
+               VALUES (?, ?, ?)""",
+            (str(path), str(parent) if parent is not None else None, path.name),
+        )
+        if parent is not None:
+            self.connection.execute(
+                "UPDATE scan_directories SET child_count = child_count + 1 WHERE path = ?",
+                (str(parent),),
+            )
+        self._commit_periodically()
+
+    def add_scanned_image(self, path: Path) -> None:
+        """Record a JPEG found during the single filesystem scan."""
+        self.connection.execute(
+            "INSERT INTO scan_images(path, directory_path, filename) VALUES (?, ?, ?)",
             (str(path), str(path.parent), path.name),
         )
         self.connection.execute(
-            "UPDATE directories SET jpeg_count = jpeg_count + 1 WHERE path = ?",
+            """UPDATE scan_directories SET direct_jpeg_count = direct_jpeg_count + 1
+               WHERE path = ?""",
             (str(path.parent),),
         )
+        self._commit_periodically()
 
-    def add_skipped(self, directory: Path, filename: str) -> None:
-        """Record one unsupported file in a directory."""
+    def scanned_directories(self) -> Iterator[sqlite3.Row]:
+        """Yield scanned directory metadata without loading it into memory."""
+        yield from self.connection.execute(
+            "SELECT * FROM scan_directories ORDER BY path COLLATE NOCASE, path"
+        )
 
-        directory = directory.resolve()
+    def scanned_children(self, parent: Path) -> Iterator[sqlite3.Row]:
+        """Yield direct scanned child directories."""
+        yield from self.connection.execute(
+            """SELECT * FROM scan_directories WHERE parent_path = ?
+               ORDER BY path COLLATE NOCASE, path""",
+            (str(parent),),
+        )
+
+    def group_sibling_directories(self) -> Iterator[Path]:
+        """Yield GROUP-prefixed directories with at least one GROUP sibling."""
+        yield from (
+            Path(row["path"])
+            for row in self.connection.execute(
+                """SELECT child.path FROM scan_directories AS child
+                   JOIN (
+                       SELECT parent_path FROM scan_directories
+                       WHERE name LIKE 'GROUP%'
+                       GROUP BY parent_path HAVING COUNT(*) >= 2
+                   ) AS grouped ON grouped.parent_path = child.parent_path
+                   WHERE child.name LIKE 'GROUP%'
+                   ORDER BY child.path COLLATE NOCASE, child.path"""
+            )
+        )
+
+    def scanned_images(self) -> Iterator[sqlite3.Row]:
+        """Yield scanned JPEG rows in deterministic path order."""
+        yield from self.connection.execute(
+            "SELECT * FROM scan_images ORDER BY path COLLATE NOCASE, path"
+        )
+
+    def discard_scan_state(self) -> None:
+        """Drop provisional inventory tables after encounter assignment."""
+        self.connection.executescript(
+            "DROP TABLE scan_images; DROP TABLE scan_directories;"
+        )
+        self.commit()
+
+    def set_encounter_output(self, path: Path, output_path: Path) -> None:
+        """Record the report/output root for an encounter."""
         self.connection.execute(
-            "INSERT INTO skipped_files(directory_path, filename) VALUES (?, ?)",
-            (str(directory), filename),
+            "UPDATE encounters SET output_path = ? WHERE path = ?",
+            (str(output_path), str(path.resolve())),
+        )
+        self._commit_periodically()
+
+    def add_image(self, path: Path, encounter: Path) -> None:
+        """Add a source image owned by an encounter."""
+        path = path.resolve()
+        encounter = encounter.resolve()
+        self.connection.execute(
+            """INSERT INTO source_images(path, encounter_path, relative_path, filename)
+               VALUES (?, ?, ?, ?)""",
+            (str(path), str(encounter), path.relative_to(encounter).as_posix(), path.name),
         )
         self.connection.execute(
-            "UPDATE directories SET skipped_count = skipped_count + 1 WHERE path = ?",
-            (str(directory),),
+            "UPDATE encounters SET image_count = image_count + 1 WHERE path = ?",
+            (str(encounter),),
         )
+        self._commit_periodically()
+
+    def add_skipped_undated(self, path: Path) -> None:
+        """Record a JPEG excluded for lacking a dated encounter ancestor."""
+        self.connection.execute(
+            "INSERT OR IGNORE INTO skipped_undated(path) VALUES (?)", (str(path.resolve()),)
+        )
+        self._commit_periodically()
 
     def finish_inventory(self) -> None:
-        """Commit all inventory rows."""
+        """Commit inventoried rows."""
+        self.commit()
 
-        self.connection.commit()
-
-    def record_result(
-        self,
-        image_path: Path,
-        detected_fins: int,
-        accepted: Iterable[dict[str, object]],
-    ) -> None:
-        """Record completed detections and accepted identifications."""
-
-        image_path = image_path.resolve()
-        accepted_rows = list(accepted)
-        directory = str(image_path.parent)
-        state = "accepted" if accepted_rows else "rejected"
-        self.connection.execute(
-            "UPDATE source_images SET state = ? WHERE path = ?",
-            (state, str(image_path)),
-        )
-        self.connection.execute(
-            """
-            UPDATE directories
-            SET processed_count = processed_count + 1,
-                detected_fins = detected_fins + ?,
-                accepted_images = accepted_images + ?,
-                rejected_images = rejected_images + ?
-            WHERE path = ?
-            """,
-            (
-                detected_fins,
-                1 if accepted_rows else 0,
-                0 if accepted_rows else 1,
-                directory,
-            ),
-        )
-        if accepted_rows:
-            cursor = self.connection.execute(
-                "INSERT INTO accepted_images(directory_path, filename) VALUES (?, ?)",
-                (directory, image_path.name),
-            )
-            image_id = int(cursor.lastrowid)
-            self.connection.executemany(
-                """
-                INSERT INTO accepted_fins(
-                    image_id, identity, score, score_type, detection_confidence,
-                    x1, y1, x2, y2
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        image_id,
-                        str(row["identity"]),
-                        float(row["score"]),
-                        str(row["score_type"]),
-                        float(row["detection_confidence"]),
-                        int(row["x1"]),
-                        int(row["y1"]),
-                        int(row["x2"]),
-                        int(row["y2"]),
-                    )
-                    for row in accepted_rows
-                ],
-            )
-        self.connection.commit()
-
-    def record_failure(self, image_path: Path, message: str) -> None:
-        """Record one failed source image and its error message."""
-
-        image_path = image_path.resolve()
-        self.connection.execute(
-            "UPDATE source_images SET state = 'failed' WHERE path = ?",
-            (str(image_path),),
-        )
-        self.connection.execute(
-            """
-            UPDATE directories
-            SET processed_count = processed_count + 1,
-                failure_count = failure_count + 1
-            WHERE path = ?
-            """,
-            (str(image_path.parent),),
-        )
-        self.connection.execute(
-            "INSERT INTO failures(directory_path, filename, message) VALUES (?, ?, ?)",
-            (str(image_path.parent), image_path.name, message),
-        )
-        self.connection.commit()
-
-    def mark_pending_failed(self, message: str) -> int:
-        """Mark every pending image failed and return the affected count."""
-
-        rows = list(
-            self.connection.execute(
-                "SELECT path FROM source_images WHERE state = 'pending' ORDER BY path"
-            )
-        )
-        for row in rows:
-            self.record_failure(Path(row["path"]), message)
-        return len(rows)
-
-    def directories(self) -> Iterator[sqlite3.Row]:
-        """Yield all directory summary rows in path order."""
-
-        yield from self.connection.execute("SELECT * FROM directories ORDER BY path")
-
-    def directory_paths(self) -> list[Path]:
-        """Return all inventoried directory paths."""
-
-        return [Path(row["path"]) for row in self.directories()]
-
-    def has_directory(self, path: Path) -> bool:
-        """Return whether a directory exists in the inventory."""
-
-        path = path.resolve()
-        row = self.connection.execute(
-            "SELECT 1 FROM directories WHERE path = ?",
-            (str(path),),
-        ).fetchone()
-        return row is not None
-
-    def child_directories(self, path: Path) -> Iterator[Path]:
-        """Yield direct inventoried children of a directory."""
-
-        path = path.resolve()
+    def pending_paths(self) -> Iterator[Path]:
+        """Yield pending source paths in deterministic order."""
         for row in self.connection.execute(
-            """
-            SELECT path FROM directories WHERE parent_path = ?
-            ORDER BY path COLLATE NOCASE, path
-            """,
-            (str(path),),
+            "SELECT path FROM source_images WHERE state = 'pending' ORDER BY path COLLATE NOCASE, path"
         ):
             yield Path(row["path"])
 
-    def accepted_images(self, directory: Path) -> Iterator[sqlite3.Row]:
-        """Yield accepted images in one directory."""
+    def record_result(
+        self, image_path: Path, detections: Iterable[dict[str, object]],
+        identities: Iterable[dict[str, object]], category: str, side: str | None,
+    ) -> None:
+        """Persist detections, identities, and the image's single assignment."""
+        row = self.connection.execute(
+            "SELECT id FROM source_images WHERE path = ?", (str(image_path.resolve()),)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Image was not inventoried: {image_path}")
+        image_id = int(row["id"])
+        detection_ids: list[int] = []
+        for detection in detections:
+            cursor = self.connection.execute(
+                """INSERT INTO detections(
+                    image_id, class_id, class_name, side, confidence, selected,
+                    x1, y1, x2, y2) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (image_id, int(detection["class_id"]), str(detection["class_name"]),
+                 detection.get("side"), float(detection["confidence"]),
+                 1 if detection.get("selected") else 0, int(detection["x1"]),
+                 int(detection["y1"]), int(detection["x2"]), int(detection["y2"])),
+            )
+            detection_ids.append(int(cursor.lastrowid))
+        best: dict[str, dict[str, object]] = {}
+        for identity in identities:
+            name = str(identity["identity"])
+            if name not in best or float(identity["score"]) > float(best[name]["score"]):
+                best[name] = identity
+        for identity in best.values():
+            index = int(identity.get("detection_index", -1))
+            detection_id = detection_ids[index] if 0 <= index < len(detection_ids) else None
+            self.connection.execute(
+                """INSERT INTO identities(image_id, detection_id, identity, score, score_type)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (image_id, detection_id, str(identity["identity"]),
+                 float(identity["score"]), str(identity["score_type"])),
+            )
+        primary = min(
+            best.values(),
+            key=lambda item: (-float(item["score"]), str(item["identity"])),
+            default=None,
+        )
+        self.connection.execute(
+            """UPDATE source_images SET state = 'processed', cluster_category = ?,
+               cluster_side = ?, primary_identity = ?, primary_identity_score = ?
+               WHERE id = ?""",
+            (
+                category,
+                side,
+                str(primary["identity"]) if primary is not None else None,
+                float(primary["score"]) if primary is not None else None,
+                image_id,
+            ),
+        )
+        self._commit_periodically()
 
-        directory = directory.resolve()
-        yield from self.connection.execute(
-            """
-            SELECT id, filename FROM accepted_images
-            WHERE directory_path = ? ORDER BY filename COLLATE NOCASE, filename
-            """,
-            (str(directory),),
+    def record_failure(self, image_path: Path, message: str) -> None:
+        """Record a failed image as a Rest assignment."""
+        self.connection.execute(
+            """UPDATE source_images SET state = 'failed', cluster_category = 'Rest',
+               cluster_side = NULL, failure_message = ? WHERE path = ?""",
+            (message, str(image_path.resolve())),
+        )
+        self._commit_periodically()
+
+    def mark_pending_failed(self, message: str) -> int:
+        """Mark pending rows as failed and return their count."""
+        cursor = self.connection.execute(
+            """UPDATE source_images SET state = 'failed', cluster_category = 'Rest',
+               cluster_side = NULL, failure_message = ? WHERE state = 'pending'""", (message,)
+        )
+        self.commit()
+        return int(cursor.rowcount)
+
+    def set_copied_filename(self, image_id: int, filename: str) -> None:
+        """Record a copied flattened filename."""
+        self.connection.execute(
+            "UPDATE source_images SET copied_filename = ? WHERE id = ?", (filename, image_id)
+        )
+        self._commit_periodically()
+
+    def encounters(self) -> Iterator[sqlite3.Row]:
+        """Yield encounter rows in source path order."""
+        yield from self.connection.execute("SELECT * FROM encounters ORDER BY path")
+
+    def encounter_images(self, encounter: Path, category: str | None = None) -> Iterator[sqlite3.Row]:
+        """Yield completed encounter images, optionally in one category."""
+        sql = "SELECT * FROM source_images WHERE encounter_path = ? AND state != 'pending'"
+        values: list[object] = [str(encounter.resolve())]
+        if category is not None:
+            sql += " AND cluster_category = ?"
+            values.append(category)
+        sql += " ORDER BY relative_path COLLATE NOCASE, relative_path"
+        yield from self.connection.execute(sql, values)
+
+    def encounter_category_count(self, encounter: Path, category: str) -> int:
+        """Return the number of completed encounter images in a category."""
+        return int(
+            self.connection.execute(
+                """SELECT COUNT(*) FROM source_images
+                   WHERE encounter_path = ? AND state != 'pending'
+                   AND cluster_category = ?""",
+                (str(encounter.resolve()), category),
+            ).fetchone()[0]
         )
 
-    def accepted_fins(self, image_id: int) -> Iterator[sqlite3.Row]:
-        """Yield accepted fin identifications for one image."""
-
-        yield from self.connection.execute(
-            """
-            SELECT * FROM accepted_fins WHERE image_id = ?
-            ORDER BY score DESC, identity
-            """,
-            (image_id,),
+    def encounter_failure_count(self, encounter: Path) -> int:
+        """Return the number of failed images in an encounter."""
+        return int(
+            self.connection.execute(
+                """SELECT COUNT(*) FROM source_images
+                   WHERE encounter_path = ? AND failure_message IS NOT NULL""",
+                (str(encounter.resolve()),),
+            ).fetchone()[0]
         )
 
-    def skipped_files(self, directory: Path) -> Iterator[str]:
-        """Yield skipped filenames in one directory."""
-
-        directory = directory.resolve()
-        for row in self.connection.execute(
-            """
-            SELECT filename FROM skipped_files WHERE directory_path = ?
-            ORDER BY filename COLLATE NOCASE, filename
-            """,
-            (str(directory),),
-        ):
-            yield str(row["filename"])
-
-    def failures(self, directory: Path) -> Iterator[sqlite3.Row]:
-        """Yield failed filenames and messages in one directory."""
-
-        directory = directory.resolve()
+    def primary_identity_groups(self, encounter: Path) -> Iterator[sqlite3.Row]:
+        """Yield primary identities and image counts for an encounter."""
         yield from self.connection.execute(
-            """
-            SELECT filename, message FROM failures WHERE directory_path = ?
-            ORDER BY filename COLLATE NOCASE, filename
-            """,
-            (str(directory),),
+            """SELECT primary_identity AS identity, COUNT(*) AS image_count
+               FROM source_images WHERE encounter_path = ?
+                 AND cluster_category = 'IDed' AND primary_identity IS NOT NULL
+               GROUP BY primary_identity
+               ORDER BY primary_identity COLLATE NOCASE, primary_identity""",
+            (str(encounter.resolve()),),
+        )
+
+    def identified_images(self, encounter: Path, primary_identity: str) -> Iterator[sqlite3.Row]:
+        """Yield identified images whose highest-scoring identity matches a value."""
+        yield from self.connection.execute(
+            """SELECT * FROM source_images WHERE encounter_path = ?
+                 AND cluster_category = 'IDed' AND primary_identity = ?
+               ORDER BY relative_path COLLATE NOCASE, relative_path""",
+            (str(encounter.resolve()), primary_identity),
+        )
+
+    def detections(self, image_id: int) -> Iterator[sqlite3.Row]:
+        """Yield raw detections for an image."""
+        yield from self.connection.execute(
+            "SELECT * FROM detections WHERE image_id = ? ORDER BY confidence DESC, id", (image_id,)
+        )
+
+    def identities(self, image_id: int) -> Iterator[sqlite3.Row]:
+        """Yield accepted identities for an image by score."""
+        yield from self.connection.execute(
+            "SELECT * FROM identities WHERE image_id = ? ORDER BY score DESC, identity", (image_id,)
         )
 
     def total_images(self) -> int:
-        """Return the total number of inventoried JPEG images."""
-
-        row = self.connection.execute(
-            "SELECT COALESCE(SUM(jpeg_count), 0) AS total FROM directories"
-        ).fetchone()
-        return int(row["total"])
+        """Return inventoried dated JPEG count."""
+        return int(self.connection.execute("SELECT COUNT(*) FROM source_images").fetchone()[0])
 
     def processed_images(self) -> int:
-        """Return the total number of completed image rows."""
+        """Return completed or failed image count."""
+        return int(self.connection.execute(
+            "SELECT COUNT(*) FROM source_images WHERE state != 'pending'"
+        ).fetchone()[0])
 
-        row = self.connection.execute(
-            "SELECT COALESCE(SUM(processed_count), 0) AS total FROM directories"
-        ).fetchone()
-        return int(row["total"])
+    def encounter_count(self) -> int:
+        """Return discovered encounter count."""
+        return int(self.connection.execute("SELECT COUNT(*) FROM encounters").fetchone()[0])
 
-    def directory_count(self) -> int:
-        """Return the number of inventoried directories."""
+    def skipped_undated_count(self) -> int:
+        """Return excluded undated JPEG count."""
+        return int(self.connection.execute("SELECT COUNT(*) FROM skipped_undated").fetchone()[0])
 
-        row = self.connection.execute("SELECT COUNT(*) AS total FROM directories").fetchone()
-        return int(row["total"])
+    def skipped_undated_paths(self, limit: int = 10) -> list[Path]:
+        """Return representative excluded paths."""
+        return [Path(row[0]) for row in self.connection.execute(
+            "SELECT path FROM skipped_undated ORDER BY path LIMIT ?", (limit,)
+        )]
+
+    def clustered_images(self) -> int:
+        """Return number of rows with a copied filename."""
+        return int(self.connection.execute(
+            "SELECT COUNT(*) FROM source_images WHERE copied_filename IS NOT NULL"
+        ).fetchone()[0])
 
     def close(self) -> None:
-        """Close SQLite and remove all temporary database files."""
-
+        """Close and remove temporary database files."""
         if self.connection is not None:
             self.connection.close()
             self.connection = None  # type: ignore[assignment]
-        for candidate in (
-            self.path,
-            Path(str(self.path) + "-wal"),
-            Path(str(self.path) + "-shm"),
-        ):
+        for candidate in (self.path, Path(str(self.path) + "-wal"), Path(str(self.path) + "-shm")):
             try:
                 candidate.unlink()
             except FileNotFoundError:
