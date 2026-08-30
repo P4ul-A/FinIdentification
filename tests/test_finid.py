@@ -577,7 +577,11 @@ class PipelineTests(unittest.TestCase):
 
             self.assertTrue(summary.completed)
             text = (root / report_filename(root)).read_text(encoding="utf-8")
-            self.assertIn("finSaddle_right 0.900", text)
+            self.assertIn(
+                'finSaddle_right <span style="color:#b45309;font-weight:700">'
+                "0.900</span>",
+                text,
+            )
             self.assertIn("left:70.0000%", text)
 
     def test_pipeline_config_rejects_an_empty_explicit_selection(self) -> None:

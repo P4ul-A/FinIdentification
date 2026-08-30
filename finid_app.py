@@ -78,7 +78,7 @@ class FinIdentificationApp:
         self.identifier_batch_var = tk.IntVar(value=recommendation.identifier_batch)
         self.crop_padding_var = tk.DoubleVar(value=0.0)
         self.fp16_var = tk.BooleanVar(value=True)
-        self.exclude_right_identification_var = tk.BooleanVar(value=False)
+        self.exclude_right_identification_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Loading models…")
         self.hardware_status_var = tk.StringVar(value="Checking MPS…")
         self.progress_text_var = tk.StringVar(value="Waiting to start")

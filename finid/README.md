@@ -12,8 +12,7 @@ without retaining all image paths or results in RAM.
 - `storage.py` provides temporary SQLite-backed run state.
 - `models.py` discovers identification models and performs bounded identifier
   inference.
-- `reporting.py` writes encounter reports, large-gallery data chunks, and
-  thumbnails.
+- `reporting.py` writes encounter reports and self-contained paged galleries.
 
 The desktop interface in `../finid_app.py` builds a `PipelineConfig`, starts the
 pipeline on a worker thread, and displays log and progress events.
@@ -100,7 +99,7 @@ raw class-name families, case-insensitively:
 Other detector classes are retained in report data but do not qualify for an
 identification or fallback category.
 
-The Advanced **Disable identification for RIGHT-side FinSaddles** option is off
+The Advanced **Disable identification for RIGHT-side FinSaddles** option is on
 by default. When enabled, RIGHT FinSaddle detections are not cropped or sent to
 the identification model. They remain eligible for `RIGHT/FinSaddle`, and RIGHT
 eye detections remain eligible for `RIGHT/Eyes`. Plain right fins still go to
@@ -172,7 +171,7 @@ has ended. This provides three important properties:
 
 - an existing managed output is not damaged by an incomplete new run;
 - image copying does not compete with inference for source-disk bandwidth; and
-- a copying, report, thumbnail, or disk-space failure can be rolled back.
+- a copying, report, or disk-space failure can be rolled back.
 
 When finalization begins, the application creates a hidden sibling staging
 directory for either the separate output or each in-place cluster, similar to:
@@ -240,21 +239,14 @@ Reports are never created in date/year grouping directories, category folders,
 camera folders, or other nested source directories.
 
 Small encounters are written as ordinary static galleries. Encounters with more
-than 500 completed images use a virtualized gallery:
-
-- card data is divided into managed JavaScript chunks of at most 100 images;
-- the browser loads only the current page into the DOM;
-- 480-pixel JPEG thumbnails are generated sequentially, one image at a time;
-- each thumbnail links to the corresponding full image; and
-- only one `.html` report is created.
-
-Virtual report assets are stored in a managed `FinID_<encounter>_assets`
-directory. Its `.finid-report-assets` marker allows safe replacement. These
-thumbnail JPEGs are explicitly excluded from future source inventories.
+than 500 completed images use a virtualized gallery. Card data is embedded in
+the report in pages of at most 100 images, and the browser loads only the current
+page into the DOM. Reports remain a single `.html` file and do not create a
+separate asset directory.
 
 ### 10. Atomic output publication
 
-After every copy, thumbnail, data chunk, and report has succeeded:
+After every copy and report has succeeded:
 
 1. An existing managed output is moved to a temporary backup location.
 2. The completed staging directory is renamed to the selected output path.
@@ -298,7 +290,7 @@ monotonic determinate scale covering:
 1. inventory resolution and runtime loading;
 2. detection, FinSaddle crop preparation, and identification;
 3. copying completed images into staged encounter clusters, when enabled;
-4. report cards, paged gallery data, and thumbnails; and
+4. report cards and embedded paged gallery data; and
 5. atomic publication of the completed output.
 
 Copy and report progress is updated every 25 images and at each phase boundary.
@@ -327,8 +319,8 @@ The GUI coalesces progress messages rather than queuing one event per image.
 Only representative per-image failures are sent to the activity log; all
 failures remain available from SQLite-backed reports.
 
-Large reports are streamed to disk. Only one report page worth of card data and
-one thumbnail source image are held while virtualized report assets are built.
+Large reports are streamed to disk. Only one report page worth of card data is
+held while the self-contained paged report is built.
 
 ## Stopping and failures
 
@@ -360,16 +352,16 @@ Increase one batch setting at a time and benchmark the same representative
 subset. Stop increasing when throughput no longer improves, swap becomes
 active, memory pressure rises, or an out-of-memory recovery is logged.
 
-The displayed inference rate excludes the later copy, thumbnail, report, and
+The displayed inference rate excludes the later copy, report, and
 atomic-publication stages.
 
 ## Output markers and cleanup
 
-Two markers distinguish app-owned output from user data:
+Markers distinguish app-owned output from user data:
 
 - `.finid-managed` marks a clustering output root that may be rebuilt.
-- `.finid-report-assets` marks a virtual report asset directory that may be
-  replaced or removed.
+- `.finid-report-assets` marks a legacy virtual report asset directory that is
+  removed when its report is rewritten.
 
 The application never recursively replaces an unmarked non-empty clustering
-output or an unmarked report asset directory.
+output or removes an unmarked legacy report asset directory.

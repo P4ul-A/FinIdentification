@@ -1139,7 +1139,7 @@ def run_pipeline(
                 for encounter_row in store.encounters():
                     store.set_encounter_output(Path(str(encounter_row["path"])), Path(str(encounter_row["path"])))
                 store.commit()
-            emit_log("Writing encounter reports and large-gallery thumbnails…")
+            emit_log("Writing encounter reports…")
             report_count = write_reports(
                 store,
                 ReportMetadata(

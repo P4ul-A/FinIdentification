@@ -46,9 +46,9 @@ through each encounter root. Both clustering modes copy each original once into
 Original JPEGs are never moved or modified.
 
 Encounters with more than 500 images use a paged gallery. The report loads at
-most 100 cards at once from managed local data chunks and displays sequentially
-generated 480-pixel thumbnails, while each card continues to link to the full
-image. This keeps browser DOM and decoded-image memory bounded.
+most 100 cards at once from page data embedded in the single HTML file. Images
+are loaded lazily, and each card links to the full image. No companion report
+asset directory is created.
 
 ## Models
 

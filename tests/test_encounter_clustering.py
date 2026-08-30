@@ -379,7 +379,7 @@ class ClusteringTests(unittest.TestCase):
                 any("Copying clustered images" in label for label in labels)
             )
             self.assertTrue(
-                any("reports and thumbnails" in label for label in labels)
+                any("Writing reports" in label for label in labels)
             )
             self.assertTrue(
                 any("Publishing completed output" in label for label in labels)
@@ -465,6 +465,14 @@ class ClusteringTests(unittest.TestCase):
             self.assertEqual(text.count("NKW-004_NKW-005_multi.jpg</strong>"), 1)
             self.assertIn("Original:", text)
             self.assertIn("Detections:", text)
+            self.assertIn(
+                '<span style="color:#0369a1;font-weight:700">0.250</span>',
+                text,
+            )
+            self.assertIn(
+                '<span style="color:#b45309;font-weight:700">0.250</span>',
+                text,
+            )
             self.assertIn("Problem:", text)
 
     def test_undated_skip_duplicate_names_and_managed_rerun(self) -> None:
@@ -544,7 +552,7 @@ class ClusteringTests(unittest.TestCase):
             self.assertTrue(report.is_file())
             self.assertIn("Partial", report.read_text(encoding="utf-8"))
 
-    def test_large_report_uses_paged_chunks_and_thumbnails(self) -> None:
+    def test_large_report_embeds_paged_data_without_asset_directory(self) -> None:
         detector_model, identifier_model = models()
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "source"
@@ -575,12 +583,42 @@ class ClusteringTests(unittest.TestCase):
             report = output / encounter.name / report_filename(encounter)
             assets = output / encounter.name / f"FinID_{encounter.name}_assets"
             self.assertTrue(summary.completed)
-            self.assertIn("FINID_SECTIONS", report.read_text(encoding="utf-8"))
-            self.assertEqual(len(list((assets / "thumbs").glob("*.jpg"))), 5)
-            self.assertEqual(len(list(assets.glob("section-*.js"))), 3)
-            self.assertTrue((assets / ".finid-report-assets").is_file())
+            text = report.read_text(encoding="utf-8")
+            self.assertIn("FINID_SECTIONS", text)
+            self.assertIn('type="application/json" id="finid-page-', text)
+            self.assertIn('"pages":["finid-page-', text)
+            self.assertFalse(assets.exists())
 
-    def test_report_setup_failure_removes_asset_staging_directory(self) -> None:
+    def test_report_removes_legacy_managed_asset_directory(self) -> None:
+        detector_model, identifier_model = models()
+        with tempfile.TemporaryDirectory() as temporary:
+            encounter = Path(temporary) / "2026-07-10 Legacy Assets"
+            save_jpeg(encounter / "one.jpg")
+            assets = encounter / f"FinID_{encounter.name}_assets"
+            save_jpeg(assets / "thumbs" / "thumbnail.jpg")
+            (assets / ".finid-report-assets").write_text(
+                "managed",
+                encoding="utf-8",
+            )
+
+            summary = run_pipeline(
+                PipelineConfig(
+                    encounter,
+                    detector_model,
+                    identifier_model,
+                    detector_classes=CLASSES,
+                    selected_class_ids=(0,),
+                ),
+                runtime=Detector({}),
+                identifier_runtime=Identifier([]),
+                probe=lambda: (True, "ready"),
+            )
+
+            self.assertTrue(summary.completed)
+            self.assertFalse(assets.exists())
+            self.assertTrue((encounter / report_filename(encounter)).is_file())
+
+    def test_report_setup_failure_removes_temporary_report(self) -> None:
         detector_model, identifier_model = models()
         with tempfile.TemporaryDirectory() as temporary:
             encounter = Path(temporary) / "2026-07-10 Asset Cleanup"
