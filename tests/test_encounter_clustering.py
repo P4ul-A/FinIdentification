@@ -214,6 +214,129 @@ class EncounterDiscoveryTests(unittest.TestCase):
 
 
 class ClusteringTests(unittest.TestCase):
+    def test_inplace_clusters_are_managed_and_excluded_from_reruns(self) -> None:
+        detector_model, identifier_model = models()
+        with tempfile.TemporaryDirectory() as temporary:
+            encounter = Path(temporary) / "2026-03-28 In Place"
+            source_image = encounter / "one.jpg"
+            save_jpeg(source_image)
+            config = PipelineConfig(
+                encounter,
+                detector_model,
+                identifier_model,
+                clustering=True,
+                inplace_clustering=True,
+                detector_classes=CLASSES,
+                selected_class_ids=(0,),
+            )
+
+            first = run_pipeline(
+                config,
+                runtime=Detector({}),
+                identifier_runtime=Identifier([]),
+                probe=lambda: (True, "ready"),
+            )
+            second = run_pipeline(
+                config,
+                runtime=Detector({}),
+                identifier_runtime=Identifier([]),
+                probe=lambda: (True, "ready"),
+            )
+
+            clusters = encounter / f"FinID_{encounter.name}_clusters"
+            self.assertTrue(first.completed)
+            self.assertTrue(second.completed)
+            self.assertEqual(first.total, 1)
+            self.assertEqual(second.total, 1)
+            self.assertEqual(second.clustered_image_count, 1)
+            self.assertTrue(source_image.is_file())
+            self.assertTrue((clusters / MANAGEMENT_MARKER).is_file())
+            self.assertTrue((clusters / "Rest/one.jpg").is_file())
+            self.assertTrue((clusters / report_filename(encounter)).is_file())
+            self.assertEqual(
+                second.root_report,
+                (clusters / report_filename(encounter)).resolve(),
+            )
+
+    def test_right_identification_toggle_preserves_right_classification(self) -> None:
+        detector_model, identifier_model = models()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            encounter = source / "2026-03-29 Left Only"
+            for name in ("left.jpg", "right-eye.jpg", "right-fin.jpg", "right-saddle.jpg"):
+                save_jpeg(encounter / name)
+            output = Path(temporary) / "output"
+            boxes = {
+                "left.jpg": [detection(2)],
+                "right-eye.jpg": [detection(5)],
+                "right-fin.jpg": [detection(1)],
+                "right-saddle.jpg": [detection(3)],
+            }
+            identifier = Identifier([0.9])
+
+            summary = run_pipeline(
+                PipelineConfig(
+                    source,
+                    detector_model,
+                    identifier_model,
+                    exclude_right_identification=True,
+                    clustering=True,
+                    output_root=output,
+                    detector_classes=CLASSES,
+                    selected_class_ids=(0, 1, 2, 3),
+                ),
+                runtime=Detector(boxes),
+                identifier_runtime=identifier,
+                probe=lambda: (True, "ready"),
+            )
+
+            target = output / encounter.name
+            self.assertTrue(summary.completed)
+            self.assertEqual(identifier.batch_sizes, [1])
+            self.assertTrue((target / "LEFT/IDed/NKW-001_left.jpg").is_file())
+            self.assertFalse((target / "RIGHT/IDed").exists())
+            self.assertTrue((target / "RIGHT/Eyes/right-eye.jpg").is_file())
+            self.assertTrue(
+                (target / "RIGHT/FinSaddle/right-saddle.jpg").is_file()
+            )
+            self.assertTrue((target / "Rest/right-fin.jpg").is_file())
+            report = target / report_filename(encounter)
+            report_text = report.read_text(encoding="utf-8")
+            self.assertIn("RIGHT-side identification disabled", report_text)
+            self.assertIn("finSaddle_right", report_text)
+            self.assertIn("eye_right", report_text)
+
+    def test_runtime_cleanup_failure_does_not_discard_completed_results(self) -> None:
+        detector_model, identifier_model = models()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "2026-03-30 Cleanup"
+            save_jpeg(source / "one.jpg")
+            detector = Detector({})
+            detector.close = lambda: (_ for _ in ()).throw(
+                RuntimeError("close failed")
+            )
+            messages: list[str] = []
+
+            summary = run_pipeline(
+                PipelineConfig(
+                    source,
+                    detector_model,
+                    identifier_model,
+                    detector_classes=CLASSES,
+                    selected_class_ids=(0,),
+                ),
+                runtime=detector,
+                identifier_runtime=Identifier([]),
+                probe=lambda: (True, "ready"),
+                log=messages.append,
+            )
+
+            self.assertTrue(summary.completed)
+            self.assertIsNone(summary.error)
+            self.assertTrue(
+                any("could not fully close detector runtime" in item for item in messages)
+            )
+
     def test_progress_is_monotonic_across_every_pipeline_phase(self) -> None:
         detector_model, identifier_model = models()
         with tempfile.TemporaryDirectory() as temporary:
@@ -456,6 +579,52 @@ class ClusteringTests(unittest.TestCase):
             self.assertEqual(len(list((assets / "thumbs").glob("*.jpg"))), 5)
             self.assertEqual(len(list(assets.glob("section-*.js"))), 3)
             self.assertTrue((assets / ".finid-report-assets").is_file())
+
+    def test_report_setup_failure_removes_asset_staging_directory(self) -> None:
+        detector_model, identifier_model = models()
+        with tempfile.TemporaryDirectory() as temporary:
+            encounter = Path(temporary) / "2026-07-10 Asset Cleanup"
+            save_jpeg(encounter / "one.jpg")
+            original_mkstemp = tempfile.mkstemp
+
+            def fail_report_file(*args: object, **kwargs: object) -> tuple[int, str]:
+                """Fail HTML staging while allowing SQLite temporary files.
+
+                Parameters:
+                    args: Positional ``mkstemp`` arguments.
+                    kwargs: Keyword ``mkstemp`` arguments.
+
+                Returns:
+                    A descriptor and path for non-report temporary files.
+                """
+                if kwargs.get("suffix") == ".tmp":
+                    raise OSError("temporary report failed")
+                return original_mkstemp(*args, **kwargs)
+
+            with (
+                patch("finid.reporting.VIRTUALIZE_THRESHOLD", 0),
+                patch(
+                    "finid.reporting.tempfile.mkstemp",
+                    side_effect=fail_report_file,
+                ),
+            ):
+                summary = run_pipeline(
+                    PipelineConfig(
+                        encounter,
+                        detector_model,
+                        identifier_model,
+                        detector_classes=CLASSES,
+                        selected_class_ids=(0,),
+                    ),
+                    runtime=Detector({}),
+                    identifier_runtime=Identifier([]),
+                    probe=lambda: (True, "ready"),
+                )
+
+            self.assertIn("temporary report failed", summary.error or "")
+            self.assertFalse(
+                any(encounter.glob(f".FinID_{encounter.name}_assets.*"))
+            )
 
 
 if __name__ == "__main__":

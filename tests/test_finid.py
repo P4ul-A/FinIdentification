@@ -4,6 +4,7 @@ import hashlib
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -31,7 +32,12 @@ from finid.pipeline import (
 )
 from finid.reporting import ReportMetadata, report_filename, write_reports
 from finid.storage import ResultStore
-from finid_app import FinIdentificationApp
+from finid_app import (
+    OUTPUT_CLUSTER_INPLACE,
+    OUTPUT_CLUSTER_LOCATION,
+    OUTPUT_REPORT,
+    FinIdentificationApp,
+)
 
 
 class FakeDetectorRuntime:
@@ -154,6 +160,44 @@ class BatchRecommendationTests(unittest.TestCase):
 
 
 class AppInputTests(unittest.TestCase):
+    def test_run_boundary_log_messages_include_times_and_outcome(self) -> None:
+        moment = datetime(2026, 8, 25, 9, 42, 7, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            FinIdentificationApp._run_time_message("Start", moment),
+            "Start time: 2026-08-25 09:42:07 UTC",
+        )
+        self.assertEqual(
+            FinIdentificationApp._run_time_message(
+                "Stop",
+                moment,
+                detail="completed; elapsed 12.5s",
+            ),
+            "Stop time: 2026-08-25 09:42:07 UTC · completed; elapsed 12.5s",
+        )
+
+    def test_three_output_modes_map_to_distinct_pipeline_settings(self) -> None:
+        destination = Path(tempfile.gettempdir()) / "finid-output-choice"
+
+        self.assertEqual(
+            FinIdentificationApp._output_settings(OUTPUT_REPORT, str(destination)),
+            (False, False, None),
+        )
+        self.assertEqual(
+            FinIdentificationApp._output_settings(
+                OUTPUT_CLUSTER_INPLACE,
+                str(destination),
+            ),
+            (True, True, None),
+        )
+        self.assertEqual(
+            FinIdentificationApp._output_settings(
+                OUTPUT_CLUSTER_LOCATION,
+                str(destination),
+            ),
+            (True, False, destination.resolve()),
+        )
+
     def test_typed_model_choices_accept_label_filename_and_path(self) -> None:
         detector, identifier = descriptors()
         detector_choices = {detector.name: detector}

@@ -61,6 +61,7 @@ class ReportMetadata:
     throughput: float
     fin_confidence: float = 0.25
     eye_confidence: float = 0.25
+    exclude_right_identification: bool = False
     message: str = ""
 
 
@@ -82,6 +83,12 @@ main{{max-width:1280px;margin:auto;padding:30px 20px 60px}}h1{{margin:.2rem 0}}h
 </style></head><body><main><div style="color:var(--blue);font-weight:700">Fin Identification Report</div>
 <h1>{html.escape(encounter.name)}</h1><p><span class="status {status_class}">{status}</span> <span class="muted">Generated {html.escape(metadata.generated_at.strftime('%Y-%m-%d %H:%M:%S %Z'))}</span></p>
 <p class="muted">Detector: {html.escape(metadata.detector_name)} · Identifier: {html.escape(metadata.identifier_name)} · Identification ≥ {metadata.threshold:.3f} · Fin/FinSaddle ≥ {metadata.fin_confidence:.3f} · Eyes ≥ {metadata.eye_confidence:.3f}</p>""")
+    if metadata.exclude_right_identification:
+        handle.write(
+            '<div class="notice"><strong>RIGHT-side identification disabled:'
+            "</strong> RIGHT FinSaddle crops were not sent for identification. "
+            "RIGHT FinSaddle and eye detections were still classified.</div>"
+        )
     if metadata.message:
         handle.write(f'<div class="notice">{html.escape(metadata.message)}</div>')
     handle.write('<section class="summary">')
@@ -101,6 +108,29 @@ def _image_href(row: object, report_root: Path) -> str:
     return quote(os.path.relpath(str(row["path"]), report_root), safe="/")
 
 
+def _report_details(
+    store: ResultStore,
+    row: object,
+) -> tuple[list[object], list[object]]:
+    """Load the report details needed for one image.
+
+    Parameters:
+        store: Disk-backed run results.
+        row: Source-image database row.
+
+    Returns:
+        Accepted identities and raw detections. Identity queries are skipped
+        for categories that cannot contain accepted identities.
+    """
+    image_id = int(row["id"])
+    identities = (
+        list(store.identities(image_id))
+        if row["cluster_category"] == "IDed"
+        else []
+    )
+    return identities, list(store.detections(image_id))
+
+
 def _card(
     handle: object,
     store: ResultStore,
@@ -109,15 +139,15 @@ def _card(
     advance: Callable[[], None] | None = None,
 ) -> None:
     """Write one image card with assignment, scores, and overlays."""
-    identities = list(store.identities(int(row["id"])))
-    detections = list(store.detections(int(row["id"])))
+    identities, detections = _report_details(store, row)
     href = _image_href(row, report_root)
     width = height = 0
-    try:
-        with Image.open(Path(str(row["path"]))) as image:
-            width, height = image.size
-    except OSError:
-        pass
+    if detections:
+        try:
+            with Image.open(Path(str(row["path"]))) as image:
+                width, height = image.size
+        except OSError:
+            pass
     handle.write(f'<article class="card"><a class="image-wrap" href="{html.escape(href, quote=True)}"><img loading="lazy" src="{html.escape(href, quote=True)}" alt="{html.escape(str(row["filename"]), quote=True)}">')
     if width and height:
         for index, detection in enumerate(detections):
@@ -197,8 +227,7 @@ def _virtual_card_data(
     thumbnail_root: Path,
 ) -> dict[str, object]:
     """Build serializable card data and its sequentially generated thumbnail."""
-    identities = list(store.identities(int(row["id"])))
-    detections = list(store.detections(int(row["id"])))
+    identities, detections = _report_details(store, row)
     href = _image_href(row, report_root)
     digest = hashlib.sha1(str(row["relative_path"]).encode("utf-8")).hexdigest()[:16]
     thumbnail_name = f"{int(row['id'])}-{digest}.jpg"
@@ -424,29 +453,33 @@ def write_reports(
         encounter = Path(str(encounter_row["path"]))
         report_root = Path(str(encounter_row["output_path"] or encounter))
         report_root.mkdir(parents=True, exist_ok=True)
-        counts = {
-            category: store.encounter_category_count(encounter, category)
-            for category in ("IDed", "FinSaddle", "Eyes", "Rest")
-        }
-        counts["Total"] = sum(counts.values())
-        counts["Failures"] = store.encounter_failure_count(encounter)
+        counts = store.encounter_counts(encounter)
         report_path = report_root / report_filename(encounter)
         assets_name = _asset_directory_name(encounter)
         assets_path = report_root / assets_name
         virtualized = counts["Total"] > VIRTUALIZE_THRESHOLD
         staged_assets: Path | None = None
-        if virtualized:
-            staged_assets = Path(
-                tempfile.mkdtemp(prefix=f".{assets_name}.", dir=report_root)
-            )
-            (staged_assets / "thumbs").mkdir()
-            (staged_assets / ASSET_MARKER).write_text(
-                "FinIdentification report assets\n",
-                encoding="utf-8",
-            )
-        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{report_path.name}.", suffix=".tmp", dir=report_root)
+        descriptor: int | None = None
+        temporary_path: Path | None = None
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            if virtualized:
+                staged_assets = Path(
+                    tempfile.mkdtemp(prefix=f".{assets_name}.", dir=report_root)
+                )
+                (staged_assets / "thumbs").mkdir()
+                (staged_assets / ASSET_MARKER).write_text(
+                    "FinIdentification report assets\n",
+                    encoding="utf-8",
+                )
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{report_path.name}.",
+                suffix=".tmp",
+                dir=report_root,
+            )
+            temporary_path = Path(temporary_name)
+            handle = os.fdopen(descriptor, "w", encoding="utf-8")
+            descriptor = None
+            with handle:
                 _header(handle, encounter, metadata, counts)
                 if virtualized and staged_assets is not None:
                     _write_virtual_body(
@@ -484,15 +517,18 @@ def write_reports(
             if staged_assets is not None:
                 _replace_assets(staged_assets, assets_path)
                 staged_assets = None
-            os.replace(temporary_name, report_path)
+            os.replace(temporary_path, report_path)
+            temporary_path = None
             if not virtualized and (assets_path / ASSET_MARKER).is_file():
                 shutil.rmtree(assets_path)
             written += 1
-        except Exception:
-            Path(temporary_name).unlink(missing_ok=True)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
             if staged_assets is not None:
                 shutil.rmtree(staged_assets, ignore_errors=True)
-            raise
     if progress is not None:
         progress(report_total, report_total, f"Wrote {written:,} encounter reports.")
     return written

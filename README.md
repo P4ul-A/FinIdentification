@@ -20,9 +20,10 @@ read and copied.
    whenever the model changes.
 3. Choose the fin-identification model and set the minimum score required for
    a good identification.
-4. Optionally enable clustering and choose a separate empty output folder.
-   A previous output can be rebuilt only when it contains the app's
-   `.finid-managed` marker.
+4. Choose one of three output modes: HTML reports beside the originals,
+   managed cluster folders inside each encounter, or managed cluster folders
+   in a separate output location. A previous cluster output can be rebuilt
+   only when it contains the app's `.finid-managed` marker.
 5. Set the identification, Fin/FinSaddle, and eye confidence thresholds, then
    select **Start identification**.
 
@@ -36,10 +37,12 @@ skipped before inference and counted in the run summary.
 
 Reports begin with identified images grouped by their highest-scoring identity,
 then show FinSaddle, Eyes, and Rest. Cards include source and copied paths,
-assignment, side, identity and detector scores, and detection overlays. Without
-clustering, reports are written in source encounter roots and images stay in
-place. With clustering, the source hierarchy is mirrored only through each
-encounter root and each original is copied once into `LEFT`, `RIGHT`, or `Rest`.
+assignment, side, identity and detector scores, and detection overlays. Report-only
+mode writes reports in source encounter roots and leaves images in place.
+In-place clustering creates a managed `FinID_<encounter>_clusters` directory
+inside each encounter. Separate-output clustering mirrors the source hierarchy
+through each encounter root. Both clustering modes copy each original once into
+`LEFT`, `RIGHT`, or `Rest` and include the report with the cluster folders.
 Original JPEGs are never moved or modified.
 
 Encounters with more than 500 images use a paged gallery. The report loads at

@@ -7,6 +7,7 @@ import queue
 import threading
 import tkinter as tk
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Any
@@ -34,6 +35,9 @@ IDENTIFICATION_MODELS_DIR = APP_DIR / "model_identification"
 LOGO_PATH = APP_DIR / "assets" / "logo_orca.png"
 LOGO_FRAME_SIZE = (166, 124)
 LOGO_SUBSAMPLE = 2
+OUTPUT_REPORT = "html_report"
+OUTPUT_CLUSTER_INPLACE = "cluster_inplace"
+OUTPUT_CLUSTER_LOCATION = "cluster_location"
 
 
 class FinIdentificationApp:
@@ -42,8 +46,8 @@ class FinIdentificationApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Fin Identification")
-        self.root.geometry("1060x790")
-        self.root.minsize(920, 690)
+        self.root.geometry("1060x870")
+        self.root.minsize(920, 760)
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.latest_progress: tuple[int, int, str] | None = None
         self.stop_event = threading.Event()
@@ -62,7 +66,7 @@ class FinIdentificationApp:
         pictures = Path.home() / "Pictures"
         self.input_var = tk.StringVar(value=str(pictures if pictures.is_dir() else Path.home()))
         self.output_var = tk.StringVar(value="")
-        self.clustering_var = tk.BooleanVar(value=False)
+        self.output_mode_var = tk.StringVar(value=OUTPUT_REPORT)
         self.detector_var = tk.StringVar()
         self.identifier_var = tk.StringVar()
         self.threshold_var = tk.DoubleVar(value=0.7)
@@ -74,6 +78,7 @@ class FinIdentificationApp:
         self.identifier_batch_var = tk.IntVar(value=recommendation.identifier_batch)
         self.crop_padding_var = tk.DoubleVar(value=0.0)
         self.fp16_var = tk.BooleanVar(value=True)
+        self.exclude_right_identification_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Loading models…")
         self.hardware_status_var = tk.StringVar(value="Checking MPS…")
         self.progress_text_var = tk.StringVar(value="Waiting to start")
@@ -134,6 +139,20 @@ class FinIdentificationApp:
             "Muted.TLabel",
             background=self.colors["panel"],
             foreground=self.colors["muted"],
+        )
+        style.configure(
+            "Panel.TRadiobutton",
+            background=self.colors["panel"],
+            foreground=self.colors["text"],
+        )
+        style.map(
+            "Panel.TRadiobutton",
+            background=[
+                ("active", self.colors["panel"]),
+                ("selected", self.colors["panel"]),
+                ("disabled", self.colors["panel"]),
+            ],
+            foreground=[("disabled", self.colors["muted"])],
         )
         for widget_style in ("TEntry", "TSpinbox", "TCombobox"):
             style.configure(
@@ -378,19 +397,58 @@ class FinIdentificationApp:
             parent, text="Browse…", command=self._browse, style="Tool.TButton"
         ).grid(row=row, column=2, pady=7)
 
-        ttk.Checkbutton(
-            parent,
-            text="Copy images into encounter clusters",
-            variable=self.clustering_var,
-            command=self._sync_output_controls,
-        ).grid(row=row + 1, column=0, sticky="w", pady=7)
-        self.output_entry = ttk.Entry(parent, textvariable=self.output_var, state="disabled")
-        self.output_entry.grid(row=row + 1, column=1, sticky="ew", pady=7, padx=(0, 8))
+        ttk.Label(parent, text="Output mode", style="Body.TLabel").grid(
+            row=row + 1, column=0, sticky="nw", pady=7
+        )
+        output_modes = ttk.Frame(parent, style="Panel.TFrame")
+        output_modes.grid(
+            row=row + 1,
+            column=1,
+            columnspan=2,
+            sticky="ew",
+            pady=7,
+        )
+        output_modes.columnconfigure(1, weight=1)
+        choices = (
+            ("HTML reports only (beside the originals)", OUTPUT_REPORT),
+            (
+                "Cluster folders inside each encounter (FinID_*_clusters)",
+                OUTPUT_CLUSTER_INPLACE,
+            ),
+            ("Cluster folders in a chosen output location", OUTPUT_CLUSTER_LOCATION),
+        )
+        self.output_mode_buttons: list[ttk.Radiobutton] = []
+        for choice_row, (label, value) in enumerate(choices):
+            button = ttk.Radiobutton(
+                output_modes,
+                text=label,
+                value=value,
+                variable=self.output_mode_var,
+                command=self._sync_output_controls,
+                style="Panel.TRadiobutton",
+            )
+            button.grid(
+                row=choice_row,
+                column=0,
+                columnspan=3,
+                sticky="w",
+                pady=(0, 4),
+            )
+            self.output_mode_buttons.append(button)
+        ttk.Label(output_modes, text="Output location", style="Muted.TLabel").grid(
+            row=3, column=0, sticky="w", padx=(24, 8)
+        )
+        self.output_entry = ttk.Entry(
+            output_modes,
+            textvariable=self.output_var,
+            state="disabled",
+        )
+        self.output_entry.grid(row=3, column=1, sticky="ew", padx=(0, 8))
         self.output_button = ttk.Button(
-            parent, text="Output…", command=self._browse_output,
+            output_modes, text="Browse…", command=self._browse_output,
             style="Tool.TButton", state="disabled",
         )
-        self.output_button.grid(row=row + 1, column=2, pady=7)
+        self.output_button.grid(row=3, column=2)
 
     def _build_advanced(self, parent: ttk.Frame) -> None:
         labels = (
@@ -418,6 +476,11 @@ class FinIdentificationApp:
             text="Use FP16 for faster, lower-memory fin detection",
             variable=self.fp16_var,
         ).grid(row=len(labels), column=0, columnspan=2, sticky="w", pady=5)
+        ttk.Checkbutton(
+            parent,
+            text="Disable identification for RIGHT-side FinSaddles",
+            variable=self.exclude_right_identification_var,
+        ).grid(row=len(labels) + 1, column=0, columnspan=2, sticky="w", pady=5)
 
     def _toggle_advanced(self) -> None:
         self.advanced_visible = not self.advanced_visible
@@ -450,12 +513,20 @@ class FinIdentificationApp:
             self.output_var.set(selected)
 
     def _sync_output_controls(self) -> None:
-        """Enable output controls only when clustering is selected.
+        """Synchronize output-mode and location control states.
 
         Returns:
             None.
         """
-        state = "normal" if self.clustering_var.get() and not self.running else "disabled"
+        mode_state = "disabled" if self.running else "normal"
+        for button in self.output_mode_buttons:
+            button.configure(state=mode_state)
+        state = (
+            "normal"
+            if self.output_mode_var.get() == OUTPUT_CLUSTER_LOCATION
+            and not self.running
+            else "disabled"
+        )
         self.output_entry.configure(state=state)
         self.output_button.configure(state=state)
 
@@ -696,6 +767,7 @@ class FinIdentificationApp:
             return
         if not self._confirm_clustering_compatibility(config):
             return
+        self.log(self._run_time_message("Start"))
         self.running = True
         self.stop_event.clear()
         self.last_report = None
@@ -742,6 +814,35 @@ class FinIdentificationApp:
             )
         )
 
+    @staticmethod
+    def _output_settings(
+        mode: str,
+        output_text: str,
+    ) -> tuple[bool, bool, Path | None]:
+        """Translate one UI output choice into pipeline settings.
+
+        Parameters:
+            mode: Selected output-mode identifier.
+            output_text: Optional separate clustering destination.
+
+        Returns:
+            Clustering, in-place clustering, and separate output root values.
+        """
+        if mode not in {
+            OUTPUT_REPORT,
+            OUTPUT_CLUSTER_INPLACE,
+            OUTPUT_CLUSTER_LOCATION,
+        }:
+            raise ValueError("Choose one of the available output modes.")
+        clustering = mode != OUTPUT_REPORT
+        inplace_clustering = mode == OUTPUT_CLUSTER_INPLACE
+        output_root = (
+            Path(output_text).expanduser().resolve()
+            if mode == OUTPUT_CLUSTER_LOCATION and output_text.strip()
+            else None
+        )
+        return clustering, inplace_clustering, output_root
+
     def _config(self) -> PipelineConfig:
         input_text = self.input_var.get().strip()
         if not input_text:
@@ -770,6 +871,10 @@ class FinIdentificationApp:
         selected_class_ids = self._selected_class_ids()
         if not selected_class_ids:
             raise ValueError("Select at least one object class to identify.")
+        clustering, inplace_clustering, output_root = self._output_settings(
+            self.output_mode_var.get(),
+            self.output_var.get(),
+        )
         return PipelineConfig(
             input_dir=input_dir,
             detector=detector,
@@ -777,12 +882,12 @@ class FinIdentificationApp:
             threshold=float(self.threshold_var.get()),
             detector_confidence=float(self.detector_confidence_var.get()),
             eye_confidence=float(self.eye_confidence_var.get()),
-            clustering=bool(self.clustering_var.get()),
-            output_root=(
-                Path(self.output_var.get()).expanduser().resolve()
-                if self.output_var.get().strip()
-                else None
+            exclude_right_identification=bool(
+                self.exclude_right_identification_var.get()
             ),
+            clustering=clustering,
+            inplace_clustering=inplace_clustering,
+            output_root=output_root,
             detector_classes=self.current_classes,
             detector_image_size=int(self.image_size_var.get()),
             detector_batch_size=int(self.detector_batch_var.get()),
@@ -900,6 +1005,19 @@ class FinIdentificationApp:
         self.root.after(100, self._poll_events)
 
     def _finished(self, summary: PipelineSummary) -> None:
+        outcome = (
+            "finished with an error"
+            if summary.error
+            else "stopped safely"
+            if summary.stopped
+            else "completed"
+        )
+        self.log(
+            self._run_time_message(
+                "Stop",
+                detail=f"{outcome}; elapsed {summary.elapsed_seconds:.1f}s",
+            )
+        )
         self.running = False
         self.worker = None
         self.latest_progress = None
@@ -935,6 +1053,29 @@ class FinIdentificationApp:
             f"{summary.skipped_undated_count} undated skipped · "
             f"batches {summary.detector_batch_size}/{summary.identifier_batch_size}"
         )
+
+    @staticmethod
+    def _run_time_message(
+        label: str,
+        when: datetime | None = None,
+        *,
+        detail: str = "",
+    ) -> str:
+        """Return a local timestamp for a run boundary log entry.
+
+        Parameters:
+            label: Boundary label such as ``Start`` or ``Stop``.
+            when: Optional timestamp used for deterministic tests.
+            detail: Optional outcome or elapsed-time description.
+
+        Returns:
+            A complete user-facing activity-log message.
+        """
+        timestamp = (when or datetime.now().astimezone()).strftime(
+            "%Y-%m-%d %H:%M:%S %Z"
+        )
+        suffix = f" · {detail}" if detail else ""
+        return f"{label} time: {timestamp}{suffix}"
 
     def log(self, message: str) -> None:
         """Append a user-facing message to the activity log."""

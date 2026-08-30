@@ -34,6 +34,7 @@ JPEG_EXTENSIONS = {".jpg", ".jpeg"}
 DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}")
 ENCOUNTER_PREFIX = re.compile(r"^ENCOUNTER", re.IGNORECASE)
 MANAGEMENT_MARKER = ".finid-managed"
+INPLACE_CLUSTER_SUFFIX = "_clusters"
 LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, int, str], None]
 PROGRESS_SCALE = 1000
@@ -95,7 +96,10 @@ class EncounterImages(Collection[Path]):
     def __iter__(self) -> Iterator[Path]:
         """Yield recursively owned JPEGs without retaining their paths."""
         for path in _iter_files(self.root):
-            if path.suffix.lower() in JPEG_EXTENSIONS and _owner(path, self.encounter_roots) == self.root:
+            if (
+                path.suffix.lower() in JPEG_EXTENSIONS
+                and _image_owner(path, self.encounter_roots) == self.root
+            ):
                 yield path
 
     def __len__(self) -> int:
@@ -111,7 +115,7 @@ class EncounterImages(Collection[Path]):
             path.is_file()
             and not path.is_symlink()
             and path.suffix.lower() in JPEG_EXTENSIONS
-            and _owner(path, self.encounter_roots) == self.root
+            and _image_owner(path, self.encounter_roots) == self.root
         )
 
 
@@ -146,8 +150,12 @@ class PipelineConfig:
         threshold: Minimum identification score.
         detector_confidence: Fin/FinSaddle confidence threshold.
         eye_confidence: Eye confidence threshold.
+        exclude_right_identification: Whether RIGHT-side FinSaddle crops are
+            excluded from identification while remaining classifiable.
         clustering: Whether original JPEGs are copied into category folders.
         output_root: Empty or app-managed clustering output root.
+        inplace_clustering: Whether cluster folders are written inside each
+            source encounter rather than beneath a separate output root.
         detector_classes: Detector class metadata with ``class_id`` and ``name``.
         selected_class_ids: FinSaddle classes eligible for identification.
 
@@ -161,8 +169,10 @@ class PipelineConfig:
     threshold: float = 0.5
     detector_confidence: float = 0.25
     eye_confidence: float = 0.25
+    exclude_right_identification: bool = False
     clustering: bool = False
     output_root: Path | None = None
+    inplace_clustering: bool = False
     detector_classes: tuple[Any, ...] = ()
     detector_image_size: int = 1280
     detector_batch_size: int = 2
@@ -179,7 +189,11 @@ class PipelineConfig:
         for label, value in (("Identification", self.threshold), ("Fin/FinSaddle", self.detector_confidence), ("Eye", self.eye_confidence)):
             if not 0 <= value <= 1:
                 raise ValueError(f"{label} confidence must be between 0 and 1.")
-        if self.clustering and self.output_root is None:
+        if self.inplace_clustering and not self.clustering:
+            raise ValueError("In-place clustering requires clustering to be enabled.")
+        if self.inplace_clustering and self.output_root is not None:
+            raise ValueError("In-place clustering does not use a separate output folder.")
+        if self.clustering and not self.inplace_clustering and self.output_root is None:
             raise ValueError("Choose an output folder when clustering is enabled.")
         if self.detector_image_size < 32:
             raise ValueError("Detector image size must be at least 32.")
@@ -232,9 +246,13 @@ def _iter_tree(root: Path) -> Iterator[tuple[Path, Path | None]]:
             try:
                 if entry.is_symlink():
                     continue
-                path = Path(entry.path).resolve()
+                # ``root`` is absolute and symlinks are rejected above, so
+                # ``entry.path`` is already a canonical path for this scan.
+                # Resolving every entry would add a filesystem metadata call
+                # for every image in very large datasets.
+                path = Path(entry.path)
                 if entry.is_dir(follow_symlinks=False):
-                    if is_generated_report_assets(path):
+                    if is_generated_report_assets(path) or _is_inplace_cluster(path):
                         continue
                     yield path, None
                     stack.append((path, os.scandir(path)))
@@ -280,7 +298,7 @@ def _resolve_encounter_roots(root: Path, store: ResultStore) -> list[Path]:
     candidates = set([*base_roots, *groups])
     owned_counts = dict.fromkeys(candidates, 0)
     for row in store.scanned_images():
-        owner = _owner(Path(str(row["path"])), candidates)
+        owner = _image_owner(Path(str(row["path"])), candidates)
         if owner is not None:
             owned_counts[owner] += 1
     roots = [
@@ -292,9 +310,17 @@ def _resolve_encounter_roots(root: Path, store: ResultStore) -> list[Path]:
     return sorted(roots, key=lambda path: (len(path.parts), str(path).casefold(), str(path)))
 
 
-def _owner(path: Path, roots: Collection[Path]) -> Path | None:
-    """Return the deepest encounter root containing a path."""
-    candidate = path if path.is_dir() else path.parent
+def _image_owner(path: Path, roots: Collection[Path]) -> Path | None:
+    """Return the deepest encounter root containing an image path.
+
+    Parameters:
+        path: Known image path.
+        roots: Candidate encounter roots.
+
+    Returns:
+        Deepest owning encounter, or ``None`` when the image is undated.
+    """
+    candidate = path.parent
     while True:
         if candidate in roots:
             return candidate
@@ -366,7 +392,7 @@ def inventory_tree(
         store.add_encounter(encounter, _mirrored_relative(root, encounter))
     for row in store.scanned_images():
         path = Path(str(row["path"]))
-        encounter = _owner(path, roots)
+        encounter = _image_owner(path, roots)
         if encounter is None:
             store.add_skipped_undated(path)
         else:
@@ -396,19 +422,25 @@ def iter_jpegs(root: Path) -> Iterator[Path]:
         Path(database_name).unlink(missing_ok=True)
 
 
+def _detector_class_name(item: Any) -> str:
+    """Return the machine-readable name from detector class metadata."""
+    return str(
+        getattr(
+            item,
+            "name",
+            getattr(item, "raw_name", getattr(item, "model_name", "")),
+        )
+    )
+
+
 def _class_map(config: PipelineConfig) -> dict[int, str]:
     """Normalize detector class metadata to numeric ID and machine name."""
-    mapping: dict[int, str] = {}
-    for item in config.detector_classes:
-        class_id = int(getattr(item, "class_id", getattr(item, "id", -1)))
-        name = str(
-            getattr(
-                item,
-                "name",
-                getattr(item, "raw_name", getattr(item, "model_name", "")),
-            )
-        )
-        mapping[class_id] = name
+    mapping = {
+        int(
+            getattr(item, "class_id", getattr(item, "id", -1))
+        ): _detector_class_name(item)
+        for item in config.detector_classes
+    }
     if not mapping and config.selected_class_ids is not None:
         mapping.update({class_id: "fin_left" for class_id in config.selected_class_ids})
     return mapping
@@ -438,14 +470,7 @@ def detector_has_finsaddle_classes(classes: Sequence[Any]) -> bool:
         ``True`` when at least one class is recognized as FinSaddle or saddle.
     """
     for item in classes:
-        name = str(
-            getattr(
-                item,
-                "name",
-                getattr(item, "raw_name", getattr(item, "model_name", "")),
-            )
-        )
-        if _kind_side(name)[0] == "finsaddle":
+        if _kind_side(_detector_class_name(item))[0] == "finsaddle":
             return True
     return False
 
@@ -509,6 +534,9 @@ def _prepare_result(
         is_candidate = (
             class_id in selected
             and kind == "finsaddle"
+            and not (
+                config.exclude_right_identification and side == "RIGHT"
+            )
             and confidence >= config.detector_confidence
         )
         detections.append(
@@ -546,7 +574,7 @@ def _prepare_result(
             raise
         finally:
             image.close()
-    return _PreparedImage(Path(result.path).resolve(), detections, len(crops)), crops
+    return _PreparedImage(Path(result.path), detections, len(crops)), crops
 
 
 def _classification(
@@ -659,6 +687,35 @@ def _validate_output(output_root: Path) -> None:
     output_root.parent.mkdir(parents=True, exist_ok=True)
 
 
+def _inplace_cluster_path(encounter: Path) -> Path:
+    """Return the managed in-place cluster root for an encounter.
+
+    Parameters:
+        encounter: Source encounter directory.
+
+    Returns:
+        A sibling-to-images cluster directory inside the encounter.
+    """
+    return encounter / f"FinID_{encounter.name}{INPLACE_CLUSTER_SUFFIX}"
+
+
+def _is_inplace_cluster(path: Path) -> bool:
+    """Return whether a directory is a managed in-place cluster tree.
+
+    Parameters:
+        path: Directory candidate encountered during inventory.
+
+    Returns:
+        ``True`` only for app-named cluster roots carrying the management marker.
+    """
+    return (
+        path.is_dir()
+        and path.name.startswith("FinID_")
+        and path.name.endswith(INPLACE_CLUSTER_SUFFIX)
+        and (path / MANAGEMENT_MARKER).is_file()
+    )
+
+
 def _preflight_source_reports(store: ResultStore) -> None:
     """Raise before inference when an encounter report cannot be replaced."""
     unwritable: list[Path] = []
@@ -698,21 +755,67 @@ def _cluster_to_staging(
     Returns:
         None.
     """
-    (stage / MANAGEMENT_MARKER).write_text("FinIdentification managed output\n", encoding="utf-8")
+    destinations = {
+        Path(str(row["path"])): stage / Path(str(row["relative_path"]))
+        for row in store.encounters()
+    }
+    _cluster_to_destinations(config, store, destinations, progress)
+    (stage / MANAGEMENT_MARKER).write_text(
+        "FinIdentification managed output\n",
+        encoding="utf-8",
+    )
+
+
+def _cluster_to_destinations(
+    config: PipelineConfig,
+    store: ResultStore,
+    destinations: dict[Path, Path],
+    progress: ProgressCallback | None = None,
+) -> None:
+    """Copy completed images into specified managed encounter roots.
+
+    Parameters:
+        config: Active pipeline configuration.
+        store: Disk-backed run results.
+        destinations: Source encounters mapped to staged cluster roots.
+        progress: Optional phase-local progress callback.
+
+    Returns:
+        None.
+    """
     copy_total = store.processed_images()
     copied = 0
     if progress is not None:
         progress(0, copy_total, "Creating staged encounter folders…")
+    cluster_directories = [
+        "LEFT/IDed",
+        "LEFT/FinSaddle",
+        "LEFT/Eyes",
+        "RIGHT/FinSaddle",
+        "RIGHT/Eyes",
+        "Rest",
+    ]
+    if not config.exclude_right_identification:
+        cluster_directories.insert(3, "RIGHT/IDed")
     for encounter_row in store.encounters():
         encounter = Path(str(encounter_row["path"]))
-        encounter_output = stage / Path(str(encounter_row["relative_path"]))
-        for relative in ("LEFT/IDed", "LEFT/FinSaddle", "LEFT/Eyes", "RIGHT/IDed", "RIGHT/FinSaddle", "RIGHT/Eyes", "Rest"):
+        encounter_output = destinations[encounter]
+        encounter_output.mkdir(parents=True, exist_ok=True)
+        (encounter_output / MANAGEMENT_MARKER).write_text(
+            "FinIdentification managed output\n",
+            encoding="utf-8",
+        )
+        for relative in cluster_directories:
             (encounter_output / relative).mkdir(parents=True, exist_ok=True)
         for row in store.encounter_images(encounter):
             category = str(row["cluster_category"])
             side = row["cluster_side"]
             destination = encounter_output / (Path(str(side)) / category if side else Path(category))
-            identities = list(store.identities(int(row["id"])))
+            identities = (
+                list(store.identities(int(row["id"])))
+                if category == "IDed"
+                else []
+            )
             prefix = "_".join(_safe_identity(str(item["identity"])) for item in identities)
             original = str(row["filename"])
             candidate = f"{prefix}_{original}" if prefix else original
@@ -761,6 +864,37 @@ def _commit_staging(stage: Path, output_root: Path) -> None:
         shutil.rmtree(backup_container, ignore_errors=True)
 
 
+def _release_runtime(
+    runtime: Any | None,
+    label: str,
+    log: LogCallback,
+    *,
+    synchronize: bool = False,
+) -> None:
+    """Release a runtime without allowing cleanup errors to lose run results.
+
+    Parameters:
+        runtime: Detector or identifier runtime, if one was created.
+        label: User-facing runtime name used in warnings.
+        log: Activity-log callback.
+        synchronize: Whether to synchronize queued device work before closing.
+
+    Returns:
+        None.
+    """
+    if runtime is None:
+        return
+    if synchronize:
+        try:
+            runtime.synchronize()
+        except Exception as exc:
+            log(f"Cleanup warning: could not synchronize {label}: {exc}")
+    try:
+        runtime.close()
+    except Exception as exc:
+        log(f"Cleanup warning: could not fully close {label}: {exc}")
+
+
 def run_pipeline(
     config: PipelineConfig, *, log: LogCallback | None = None,
     progress: ProgressCallback | None = None, stop_event: threading.Event | None = None,
@@ -778,10 +912,15 @@ def run_pipeline(
     encounter_count = skipped_undated = 0
     processing_failures = 0
     detector_batch, identifier_batch = config.detector_batch_size, config.identifier_batch_size
-    reports_root = config.output_root if config.clustering and config.output_root else config.input_dir
+    reports_root = (
+        config.output_root
+        if config.clustering and not config.inplace_clustering and config.output_root
+        else config.input_dir
+    )
     root_report = reports_root
     detector_runtime, active_identifier = runtime, identifier_runtime
     stage: Path | None = None
+    inplace_stages: list[tuple[Path, Path]] = []
     output_validated = False
     store = ResultStore()
     inference_start = 80
@@ -795,7 +934,7 @@ def run_pipeline(
     try:
         if not config.input_dir.is_dir():
             raise ValueError(f"Input folder does not exist: {config.input_dir}")
-        if config.clustering and config.output_root is not None:
+        if config.clustering and not config.inplace_clustering and config.output_root is not None:
             if config.output_root == config.input_dir or config.output_root in config.input_dir.parents or config.input_dir in config.output_root.parents:
                 raise ValueError("Input and clustering output folders must not overlap.")
             _validate_output(config.output_root)
@@ -803,6 +942,12 @@ def run_pipeline(
         emit_log("Discovering dated encounters and JPEG filenames…")
         total = inventory_tree(config.input_dir, store, scan_progress=lambda files, dirs: emit_progress(files, 0, f"Scanning… {files:,} files in {dirs:,} folders"))
         encounter_count, skipped_undated = store.encounter_count(), store.skipped_undated_count()
+        if config.inplace_clustering:
+            for encounter_row in store.encounters():
+                _validate_output(
+                    _inplace_cluster_path(Path(str(encounter_row["path"])))
+                )
+            output_validated = True
         emit_progress(50, PROGRESS_SCALE, "Inventory complete; resolving run setup…")
         if config.clustering and not detector_has_finsaddle_classes(
             config.detector_classes
@@ -815,6 +960,12 @@ def run_pipeline(
         if not config.clustering:
             _preflight_source_reports(store)
         emit_log(f"Found {encounter_count} encounters with {total} JPEG images.")
+        if config.exclude_right_identification:
+            emit_log(
+                "RIGHT-side identification is disabled for this run. RIGHT "
+                "FinSaddle and eye detections remain eligible for their "
+                "classification folders."
+            )
         if skipped_undated:
             examples = ", ".join(str(path) for path in store.skipped_undated_paths(5))
             emit_log(f"Skipped {skipped_undated} JPEGs without a dated encounter ancestor. Examples: {examples}")
@@ -888,7 +1039,7 @@ def run_pipeline(
                         if stop_event.is_set():
                             stopped = True
                             break
-                        path = Path(result.path).resolve()
+                        path = Path(result.path)
                         try:
                             state, crops = _prepare_result(
                                 result,
@@ -941,19 +1092,37 @@ def run_pipeline(
         error = str(exc)
         emit_log(f"Pipeline stopped with an error: {exc}")
     finally:
-        if detector_runtime is not None:
-            try:
-                detector_runtime.synchronize()
-            except Exception:
-                pass
-            detector_runtime.close()
-        if active_identifier is not None:
-            active_identifier.close()
+        _release_runtime(
+            detector_runtime,
+            "detector runtime",
+            emit_log,
+            synchronize=True,
+        )
+        _release_runtime(active_identifier, "identifier runtime", emit_log)
         elapsed = time.monotonic() - started
         processed = store.processed_images()
         message = error or ("The run was stopped. Results shown are for completed images only." if stopped else "")
         try:
-            if config.clustering and config.output_root is not None and output_validated:
+            if config.inplace_clustering and output_validated:
+                destinations: dict[Path, Path] = {}
+                for encounter_row in store.encounters():
+                    encounter = Path(str(encounter_row["path"]))
+                    destination = _inplace_cluster_path(encounter)
+                    staged = Path(
+                        tempfile.mkdtemp(
+                            prefix=f".{destination.name}.finid-staging-",
+                            dir=destination.parent,
+                        )
+                    )
+                    inplace_stages.append((staged, destination))
+                    destinations[encounter] = staged
+                _cluster_to_destinations(
+                    config,
+                    store,
+                    destinations,
+                    _phase_progress(emit_progress, inference_end, 900),
+                )
+            elif config.clustering and config.output_root is not None and output_validated:
                 stage = Path(tempfile.mkdtemp(prefix=f".{config.output_root.name}.finid-staging-", dir=config.output_root.parent))
                 _cluster_to_staging(
                     config,
@@ -979,6 +1148,7 @@ def run_pipeline(
                     threshold=config.threshold, score_label=config.identifier.score_label,
                     elapsed_seconds=elapsed, throughput=processed / elapsed if elapsed else 0.0,
                     fin_confidence=config.detector_confidence, eye_confidence=config.eye_confidence,
+                    exclude_right_identification=config.exclude_right_identification,
                     message=message,
                 ),
                 progress=_phase_progress(emit_progress, report_start, 990),
@@ -988,9 +1158,22 @@ def run_pipeline(
                 _commit_staging(stage, config.output_root)
                 stage = None
                 clustered = store.clustered_images()
+            elif inplace_stages:
+                emit_progress(995, PROGRESS_SCALE, "Publishing in-place clusters…")
+                for staged, destination in inplace_stages:
+                    _commit_staging(staged, destination)
+                inplace_stages.clear()
+                clustered = store.clustered_images()
             first = next(store.encounters(), None)
             if first is not None:
-                final_encounter_root = reports_root / Path(str(first["relative_path"])) if config.clustering else Path(str(first["path"]))
+                if config.inplace_clustering:
+                    final_encounter_root = _inplace_cluster_path(
+                        Path(str(first["path"]))
+                    )
+                elif config.clustering:
+                    final_encounter_root = reports_root / Path(str(first["relative_path"]))
+                else:
+                    final_encounter_root = Path(str(first["path"]))
                 root_report = final_encounter_root / report_filename(Path(str(first["path"])))
             emit_log(f"Wrote {report_count} encounter reports.")
             if error is None:
@@ -1001,11 +1184,15 @@ def run_pipeline(
                 )
         except Exception as report_exc:
             if stage is not None and stage.exists():
-                shutil.rmtree(stage)
+                shutil.rmtree(stage, ignore_errors=True)
+            for inplace_stage, _destination in inplace_stages:
+                shutil.rmtree(inplace_stage, ignore_errors=True)
+            inplace_stages.clear()
             error = f"{error}; report/output error: {report_exc}" if error else f"Could not write reports/output: {report_exc}"
             completed = False
             emit_log(error)
-        store.close()
+        finally:
+            store.close()
     return PipelineSummary(completed, stopped, processed, total, encounter_count,
         skipped_undated, clustered, report_count, reports_root, root_report,
         time.monotonic() - started, detector_batch, identifier_batch, error)

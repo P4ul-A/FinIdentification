@@ -9,6 +9,20 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 
+def _path_key(path: Path) -> str:
+    """Return a stable absolute database key without redundant filesystem I/O.
+
+    Parameters:
+        path: Path to normalize for SQLite storage or lookup.
+
+    Returns:
+        Absolute path text. Already-absolute paths are returned without a
+        filesystem-resolving system call.
+    """
+    path = Path(path).expanduser()
+    return str(path if path.is_absolute() else path.resolve())
+
+
 class ResultStore:
     """Keep inventory, detections, identities, and assignments on disk."""
 
@@ -38,9 +52,10 @@ class ResultStore:
             );
             CREATE INDEX scan_directories_parent ON scan_directories(parent_path);
             CREATE TABLE scan_images (
-                path TEXT PRIMARY KEY,
-                directory_path TEXT NOT NULL,
-                filename TEXT NOT NULL
+                path TEXT PRIMARY KEY
+            );
+            CREATE INDEX scan_images_order ON scan_images(
+                path COLLATE NOCASE, path
             );
             CREATE TABLE source_images (
                 id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL,
@@ -50,9 +65,19 @@ class ResultStore:
                 failure_message TEXT, primary_identity TEXT,
                 primary_identity_score REAL
             );
-            CREATE INDEX source_images_encounter ON source_images(encounter_path);
-            CREATE INDEX source_images_reporting ON source_images(
-                encounter_path, state, cluster_category, relative_path COLLATE NOCASE
+            CREATE INDEX source_images_pending ON source_images(
+                state, path COLLATE NOCASE, path
+            );
+            CREATE INDEX source_images_encounter_order ON source_images(
+                encounter_path, relative_path COLLATE NOCASE, relative_path
+            );
+            CREATE INDEX source_images_category_order ON source_images(
+                encounter_path, cluster_category,
+                relative_path COLLATE NOCASE, relative_path
+            );
+            CREATE INDEX source_images_identity_order ON source_images(
+                encounter_path, primary_identity,
+                relative_path COLLATE NOCASE, relative_path
             );
             CREATE TABLE detections (
                 id INTEGER PRIMARY KEY, image_id INTEGER NOT NULL,
@@ -98,7 +123,7 @@ class ResultStore:
         """
         self.connection.execute(
             "INSERT OR IGNORE INTO encounters(path, relative_path) VALUES (?, ?)",
-            (str(path.resolve()), relative_path.as_posix()),
+            (_path_key(path), relative_path.as_posix()),
         )
         self._commit_periodically()
 
@@ -119,8 +144,8 @@ class ResultStore:
     def add_scanned_image(self, path: Path) -> None:
         """Record a JPEG found during the single filesystem scan."""
         self.connection.execute(
-            "INSERT INTO scan_images(path, directory_path, filename) VALUES (?, ?, ?)",
-            (str(path), str(path.parent), path.name),
+            "INSERT INTO scan_images(path) VALUES (?)",
+            (str(path),),
         )
         self.connection.execute(
             """UPDATE scan_directories SET direct_jpeg_count = direct_jpeg_count + 1
@@ -176,29 +201,30 @@ class ResultStore:
         """Record the report/output root for an encounter."""
         self.connection.execute(
             "UPDATE encounters SET output_path = ? WHERE path = ?",
-            (str(output_path), str(path.resolve())),
+            (str(output_path), _path_key(path)),
         )
         self._commit_periodically()
 
     def add_image(self, path: Path, encounter: Path) -> None:
         """Add a source image owned by an encounter."""
-        path = path.resolve()
-        encounter = encounter.resolve()
+        path_text = _path_key(path)
+        encounter_text = _path_key(encounter)
+        relative_path = Path(path_text).relative_to(Path(encounter_text)).as_posix()
         self.connection.execute(
             """INSERT INTO source_images(path, encounter_path, relative_path, filename)
                VALUES (?, ?, ?, ?)""",
-            (str(path), str(encounter), path.relative_to(encounter).as_posix(), path.name),
+            (path_text, encounter_text, relative_path, path.name),
         )
         self.connection.execute(
             "UPDATE encounters SET image_count = image_count + 1 WHERE path = ?",
-            (str(encounter),),
+            (encounter_text,),
         )
         self._commit_periodically()
 
     def add_skipped_undated(self, path: Path) -> None:
         """Record a JPEG excluded for lacking a dated encounter ancestor."""
         self.connection.execute(
-            "INSERT OR IGNORE INTO skipped_undated(path) VALUES (?)", (str(path.resolve()),)
+            "INSERT OR IGNORE INTO skipped_undated(path) VALUES (?)", (_path_key(path),)
         )
         self._commit_periodically()
 
@@ -213,17 +239,35 @@ class ResultStore:
         ):
             yield Path(row["path"])
 
+    def _image_id(self, image_path: Path) -> int | None:
+        """Return an image ID, resolving platform path aliases only on a miss.
+
+        Parameters:
+            image_path: Source image path to find.
+
+        Returns:
+            Database image ID, or ``None`` when the image was not inventoried.
+        """
+        key = _path_key(image_path)
+        row = self.connection.execute(
+            "SELECT id FROM source_images WHERE path = ?", (key,)
+        ).fetchone()
+        if row is None:
+            resolved_key = str(Path(image_path).expanduser().resolve())
+            if resolved_key != key:
+                row = self.connection.execute(
+                    "SELECT id FROM source_images WHERE path = ?", (resolved_key,)
+                ).fetchone()
+        return int(row["id"]) if row is not None else None
+
     def record_result(
         self, image_path: Path, detections: Iterable[dict[str, object]],
         identities: Iterable[dict[str, object]], category: str, side: str | None,
     ) -> None:
         """Persist detections, identities, and the image's single assignment."""
-        row = self.connection.execute(
-            "SELECT id FROM source_images WHERE path = ?", (str(image_path.resolve()),)
-        ).fetchone()
-        if row is None:
+        image_id = self._image_id(image_path)
+        if image_id is None:
             raise KeyError(f"Image was not inventoried: {image_path}")
-        image_id = int(row["id"])
         detection_ids: list[int] = []
         for detection in detections:
             cursor = self.connection.execute(
@@ -271,10 +315,13 @@ class ResultStore:
 
     def record_failure(self, image_path: Path, message: str) -> None:
         """Record a failed image as a Rest assignment."""
+        image_id = self._image_id(image_path)
+        if image_id is None:
+            return
         self.connection.execute(
             """UPDATE source_images SET state = 'failed', cluster_category = 'Rest',
-               cluster_side = NULL, failure_message = ? WHERE path = ?""",
-            (message, str(image_path.resolve())),
+               cluster_side = NULL, failure_message = ? WHERE id = ?""",
+            (message, image_id),
         )
         self._commit_periodically()
 
@@ -301,7 +348,7 @@ class ResultStore:
     def encounter_images(self, encounter: Path, category: str | None = None) -> Iterator[sqlite3.Row]:
         """Yield completed encounter images, optionally in one category."""
         sql = "SELECT * FROM source_images WHERE encounter_path = ? AND state != 'pending'"
-        values: list[object] = [str(encounter.resolve())]
+        values: list[object] = [_path_key(encounter)]
         if category is not None:
             sql += " AND cluster_category = ?"
             values.append(category)
@@ -315,9 +362,42 @@ class ResultStore:
                 """SELECT COUNT(*) FROM source_images
                    WHERE encounter_path = ? AND state != 'pending'
                    AND cluster_category = ?""",
-                (str(encounter.resolve()), category),
+                (_path_key(encounter), category),
             ).fetchone()[0]
         )
+
+    def encounter_counts(self, encounter: Path) -> dict[str, int]:
+        """Return all report category and failure counts in one query.
+
+        Parameters:
+            encounter: Source encounter root.
+
+        Returns:
+            Counts for Total, IDed, FinSaddle, Eyes, Rest, and Failures.
+        """
+        counts = {
+            "Total": 0,
+            "IDed": 0,
+            "FinSaddle": 0,
+            "Eyes": 0,
+            "Rest": 0,
+            "Failures": 0,
+        }
+        for row in self.connection.execute(
+            """SELECT cluster_category, COUNT(*) AS image_count,
+                      SUM(failure_message IS NOT NULL) AS failure_count
+               FROM source_images
+               WHERE encounter_path = ? AND state != 'pending'
+               GROUP BY cluster_category""",
+            (_path_key(encounter),),
+        ):
+            category = str(row["cluster_category"])
+            image_count = int(row["image_count"])
+            if category in counts:
+                counts[category] = image_count
+            counts["Total"] += image_count
+            counts["Failures"] += int(row["failure_count"] or 0)
+        return counts
 
     def encounter_failure_count(self, encounter: Path) -> int:
         """Return the number of failed images in an encounter."""
@@ -325,7 +405,7 @@ class ResultStore:
             self.connection.execute(
                 """SELECT COUNT(*) FROM source_images
                    WHERE encounter_path = ? AND failure_message IS NOT NULL""",
-                (str(encounter.resolve()),),
+                (_path_key(encounter),),
             ).fetchone()[0]
         )
 
@@ -337,7 +417,7 @@ class ResultStore:
                  AND cluster_category = 'IDed' AND primary_identity IS NOT NULL
                GROUP BY primary_identity
                ORDER BY primary_identity COLLATE NOCASE, primary_identity""",
-            (str(encounter.resolve()),),
+            (_path_key(encounter),),
         )
 
     def identified_images(self, encounter: Path, primary_identity: str) -> Iterator[sqlite3.Row]:
@@ -346,7 +426,7 @@ class ResultStore:
             """SELECT * FROM source_images WHERE encounter_path = ?
                  AND cluster_category = 'IDed' AND primary_identity = ?
                ORDER BY relative_path COLLATE NOCASE, relative_path""",
-            (str(encounter.resolve()), primary_identity),
+            (_path_key(encounter), primary_identity),
         )
 
     def detections(self, image_id: int) -> Iterator[sqlite3.Row]:

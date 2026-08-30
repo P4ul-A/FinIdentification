@@ -27,12 +27,15 @@ The pipeline validates:
 - the source directory;
 - identification, Fin/FinSaddle, and eye confidence values;
 - detector and identifier batch sizes;
-- the optional clustering output directory;
+- the selected report-only, in-place cluster, or separate cluster mode;
+- the optional separate clustering output directory;
 - that input and output directories do not overlap; and
 - that an existing non-empty output contains `.finid-managed`.
 
 A new clustering output may be absent or empty. An existing non-empty output is
-replaced only when it carries the management marker. Source JPEGs are never
+replaced only when it carries the management marker. In-place mode creates one
+managed `FinID_<encounter>_clusters` directory inside each source encounter.
+Those directories are excluded from later inventories. Source JPEGs are never
 moved, renamed, overwritten, or modified.
 
 ### 2. Single-pass source inventory
@@ -96,6 +99,12 @@ raw class-name families, case-insensitively:
 
 Other detector classes are retained in report data but do not qualify for an
 identification or fallback category.
+
+The Advanced **Disable identification for RIGHT-side FinSaddles** option is off
+by default. When enabled, RIGHT FinSaddle detections are not cropped or sent to
+the identification model. They remain eligible for `RIGHT/FinSaddle`, and RIGHT
+eye detections remain eligible for `RIGHT/Eyes`. Plain right fins still go to
+`Rest`. The `RIGHT/IDed` directory is omitted from clustered output.
 
 The identification model is loaded only when at least one selected detector
 class is recognized as FinSaddle. Selecting only plain fins, eyes, or unrelated
@@ -166,7 +175,7 @@ has ended. This provides three important properties:
 - a copying, report, thumbnail, or disk-space failure can be rolled back.
 
 When finalization begins, the application creates a hidden sibling staging
-directory similar to:
+directory for either the separate output or each in-place cluster, similar to:
 
 ```text
 .selected-output.finid-staging-AbCdEf/
@@ -211,7 +220,9 @@ source path. The copied filename is stored back in SQLite for reporting.
 ### 9. Encounter reports
 
 Exactly one HTML report is written directly inside each encounter output root.
-When clustering is disabled, it is written inside the source encounter root.
+Report-only mode writes it inside the source encounter root. In-place mode puts
+it in `FinID_<encounter>_clusters`; separate-output mode puts it beside that
+encounter's cluster folders under the selected destination.
 
 Each report contains:
 
