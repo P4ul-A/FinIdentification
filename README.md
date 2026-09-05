@@ -45,6 +45,24 @@ through each encounter root. Both clustering modes copy each original once into
 `LEFT`, `RIGHT`, or `Rest` and include the report with the cluster folders.
 Original JPEGs are never moved or modified.
 
+An IDed image containing an eye detection above the configured eye threshold
+adds `EYE` between its identity prefix and original filename, for example
+`NKW-1307_EYE_original.jpg`. This also marks eye-only images connected through
+a successful camera burst; saddle-only IDed images keep the existing name.
+
+When an identification attempt is below the acceptance threshold, FinSaddle
+report cards show the three most likely identity candidates for each processed
+saddle crop. Candidate labels use the same color as their corresponding
+detection boxes.
+
+Eye-only photos are connected to saddle results from the same camera burst. A
+burst consists of photos in one immediate source folder whose consecutive EXIF
+capture times are no more than two seconds apart. Eyes inherit all accepted
+orca identities from identified saddle photos in that burst, or fall back to
+the saddle folder when no saddle was identified. Missing EXIF capture times do
+not use filename or filesystem-time fallbacks. When RIGHT identification is
+disabled, RIGHT eye photos remain in `RIGHT/Eyes` and are not burst-linked.
+
 Encounters with more than 500 images use a paged gallery. The report loads at
 most 100 cards at once from page data embedded in the single HTML file. Images
 are loaded lazily, and each card links to the full image. No companion report

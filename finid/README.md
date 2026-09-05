@@ -10,6 +10,7 @@ without retaining all image paths or results in RAM.
 - `pipeline.py` coordinates discovery, inference, classification, copying, and
   final publication.
 - `storage.py` provides temporary SQLite-backed run state.
+- `sides.py` centralizes LEFT/RIGHT identification and conflict policy.
 - `models.py` discovers identification models and performs bounded identifier
   inference.
 - `reporting.py` writes encounter reports and self-contained paged galleries.
@@ -103,7 +104,10 @@ The Advanced **Disable identification for RIGHT-side FinSaddles** option is on
 by default. When enabled, RIGHT FinSaddle detections are not cropped or sent to
 the identification model. They remain eligible for `RIGHT/FinSaddle`, and RIGHT
 eye detections remain eligible for `RIGHT/Eyes`. Plain right fins still go to
-`Rest`. The `RIGHT/IDed` directory is omitted from clustered output.
+`Rest`. RIGHT eye images do not inherit camera-burst saddle results, and the
+`RIGHT/IDed` directory is omitted from clustered output. LEFT eye images remain
+eligible for burst linking, including a fallback to `RIGHT/FinSaddle` when an
+unidentified RIGHT saddle is the burst's only saddle result.
 
 The identification model is loaded only when at least one selected detector
 class is recognized as FinSaddle. Selecting only plain fins, eyes, or unrelated
@@ -137,7 +141,9 @@ the final short batch is processed.
 
 Each crop is closed immediately after prediction. The source image used for
 cropping is also closed immediately after its crops are created. Identifier
-scores meeting the identification threshold are stored in SQLite.
+scores meeting the identification threshold are stored as accepted identities.
+For a rejected crop, its three highest-scoring candidates are stored separately
+for the FinSaddle report card and do not affect classification or filenames.
 
 If several crops return the same identity for one source image, only its
 highest score is retained. All distinct accepted identities remain associated
@@ -163,6 +169,21 @@ with their error messages.
 
 At this stage, assignments exist only in temporary SQLite. No source images
 have been copied and no visible encounter output folders are expected yet.
+
+### 6.1 Camera-burst eye linking
+
+After independent classification, processed photos are grouped by their
+immediate source folder and EXIF `DateTimeOriginal` timestamp. A new burst
+starts when the next timestamp is more than two seconds later. The optional
+`SubSecTimeOriginal` value preserves subsecond boundaries. Photos with missing
+or invalid capture metadata are not linked.
+
+Only images independently assigned to `Eyes` can change. An eye inherits every
+distinct accepted identity from IDed saddle images in its burst, retaining the
+highest score for duplicate identities. If no saddle was identified but a
+qualifying FinSaddle image exists, the eye instead moves to `FinSaddle`. The
+saddle result supplies the destination side, with `LEFT` winning when both
+sides contribute. All other assignments remain unchanged.
 
 ### 7. Why clustered folders appear near the end
 
@@ -212,6 +233,16 @@ Accepted identities prefix an identified filename in descending score order:
 NKW-001_NKW-017_original.jpg
 ```
 
+When the IDed image also has an eye detection meeting the eye threshold, `EYE`
+is inserted after all identity prefixes:
+
+```text
+NKW-001_NKW-017_EYE_original.jpg
+```
+
+The same marker is applied to eye-only photos that inherit an accepted identity
+from their camera burst. IDed images without a qualifying eye are unchanged.
+
 If flattened paths produce the same destination filename, the later collision
 receives a deterministic eight-character hash derived from its encounter-relative
 source path. The copied filename is stored back in SQLite for reporting.
@@ -231,9 +262,13 @@ Each report contains:
 - FinSaddle, Eyes, and Rest galleries;
 - copied filename and original encounter-relative path;
 - destination category and side;
-- identity and detector scores;
+- accepted identity, rejected top-three candidate, and detector scores;
 - detection overlays; and
 - processing errors.
+
+Accepted identity and rejected candidate labels use the color of the detection
+box whose crop produced that result. Burst-inherited identities remain in the
+normal text color because the eye image has no corresponding saddle box.
 
 Reports are never created in date/year grouping directories, category folders,
 camera folders, or other nested source directories.
@@ -266,7 +301,7 @@ SQLite stores all dataset-sized state:
 - encounter roots and mirrored paths;
 - source path and encounter ownership;
 - raw detections, side, confidence, and boxes;
-- accepted identities and primary identity;
+- accepted identities, rejected ranked candidates, and primary identity;
 - classification and copied filename;
 - failures; and
 - skipped undated JPEGs.

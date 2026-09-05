@@ -5,6 +5,7 @@ import tempfile
 import threading
 import tracemalloc
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,7 +14,12 @@ from PIL import Image
 from findetection_core import DetectionClass
 
 import finid.pipeline as pipeline_module
-from finid.models import DetectionModel, IdentificationModel, IdentityPrediction
+from finid.models import (
+    DetectionModel,
+    IdentificationModel,
+    IdentityCandidate,
+    IdentityPrediction,
+)
 from finid.pipeline import (
     MANAGEMENT_MARKER,
     PipelineConfig,
@@ -72,8 +78,22 @@ class Detector:
 class Identifier:
     """Return deterministic scores and distinct identities across crop calls."""
 
-    def __init__(self, scores: list[float]) -> None:
+    def __init__(
+        self,
+        scores: list[float],
+        identities: list[str] | None = None,
+    ) -> None:
+        """Initialize deterministic identifier output.
+
+        Parameters:
+            scores: Prediction scores returned in crop order.
+            identities: Optional identity names returned in crop order.
+
+        Returns:
+            None.
+        """
         self.scores = scores
+        self.identity_names = identities
         self.index = 0
         self.effective_batch_size = 8
         self.batch_sizes: list[int] = []
@@ -84,12 +104,75 @@ class Identifier:
         predictions: list[IdentityPrediction] = []
         for _crop in crops:
             score = self.scores[self.index]
+            identity = (
+                self.identity_names[self.index]
+                if self.identity_names is not None
+                else f"NKW-{self.index + 1:03d}"
+            )
             self.index += 1
-            predictions.append(IdentityPrediction(f"NKW-{self.index:03d}", score, "probability"))
+            predictions.append(IdentityPrediction(identity, score, "probability"))
         return predictions
 
     def close(self) -> None:
         """Close the fake identifier."""
+
+
+class RankedIdentifier:
+    """Return prebuilt predictions with ranked identity candidates."""
+
+    def __init__(self, predictions: list[IdentityPrediction]) -> None:
+        """Initialize ordered fake predictions.
+
+        Parameters:
+            predictions: Predictions returned in crop order.
+
+        Returns:
+            None.
+        """
+        self.predictions = predictions
+        self.offset = 0
+        self.effective_batch_size = 8
+
+    def predict(self, crops: object) -> list[IdentityPrediction]:
+        """Return one configured prediction for every supplied crop.
+
+        Parameters:
+            crops: Crop batch whose length determines the returned slice.
+
+        Returns:
+            Configured predictions for the current batch.
+        """
+        count = len(crops)
+        output = self.predictions[self.offset : self.offset + count]
+        self.offset += count
+        return output
+
+    def close(self) -> None:
+        """Close the fake identifier."""
+
+
+def ranked_prediction(
+    values: tuple[tuple[str, float], ...],
+) -> IdentityPrediction:
+    """Build a prediction containing ordered candidates.
+
+    Parameters:
+        values: Identity and score pairs in descending rank order.
+
+    Returns:
+        Best prediction carrying all supplied candidates.
+    """
+    candidates = tuple(
+        IdentityCandidate(identity, score, "probability")
+        for identity, score in values
+    )
+    best = candidates[0]
+    return IdentityPrediction(
+        best.identity,
+        best.score,
+        best.score_type,
+        candidates,
+    )
 
 
 CLASSES = (
@@ -114,6 +197,24 @@ def save_jpeg(path: Path) -> None:
     """Create a small valid JPEG and all parent directories."""
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", (40, 35), "white").save(path)
+
+
+def save_jpeg_at(path: Path, captured: datetime) -> None:
+    """Create a JPEG with an EXIF original capture timestamp.
+
+    Parameters:
+        path: Destination JPEG path.
+        captured: Naive capture time, including optional microseconds.
+
+    Returns:
+        None.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exif = Image.Exif()
+    exif[36867] = captured.strftime("%Y:%m:%d %H:%M:%S")
+    if captured.microsecond:
+        exif[37521] = f"{captured.microsecond:06d}".rstrip("0")
+    Image.new("RGB", (40, 35), "white").save(path, exif=exif)
 
 
 class EncounterDiscoveryTests(unittest.TestCase):
@@ -429,7 +530,7 @@ class ClusteringTests(unittest.TestCase):
                 "both.jpg": [detection(2, 0.25), detection(3, 0.25)],
                 "broken.jpg": [detection(2)],
                 "eye.jpg": [detection(5, 0.25)],
-                "id.jpg": [detection(3)],
+                "id.jpg": [detection(3), detection(5)],
                 "multi.jpg": [detection(2), detection(3)],
                 "plain.jpg": [detection(0)],
                 "saddle.jpg": [detection(3, 0.25)],
@@ -454,7 +555,7 @@ class ClusteringTests(unittest.TestCase):
             self.assertEqual(identifier.batch_sizes, [6])
             self.assertTrue((target / "LEFT/FinSaddle/both.jpg").is_file())
             self.assertTrue((target / "RIGHT/Eyes/eye.jpg").is_file())
-            self.assertTrue((target / "RIGHT/IDed/NKW-003_id.jpg").is_file())
+            self.assertTrue((target / "RIGHT/IDed/NKW-003_EYE_id.jpg").is_file())
             self.assertTrue((target / "LEFT/IDed/NKW-004_NKW-005_multi.jpg").is_file())
             self.assertTrue((target / "Rest/plain.jpg").is_file())
             self.assertTrue((target / "Rest/broken.jpg").is_file())
@@ -474,6 +575,292 @@ class ClusteringTests(unittest.TestCase):
                 text,
             )
             self.assertIn("Problem:", text)
+
+    def test_rejected_finsaddles_report_three_candidates_per_box(self) -> None:
+        detector_model, identifier_model = models()
+        with tempfile.TemporaryDirectory() as temporary:
+            encounter = Path(temporary) / "2026-04-05 Rejected Candidates"
+            save_jpeg(encounter / "saddles.jpg")
+            identifier = RankedIdentifier(
+                [
+                    ranked_prediction(
+                        (("NKW-101", 0.49), ("NKW-102", 0.41), ("NKW-103", 0.33))
+                    ),
+                    ranked_prediction(
+                        (("NKW-201", 0.48), ("NKW-202", 0.40), ("NKW-203", 0.32))
+                    ),
+                ]
+            )
+
+            summary = run_pipeline(
+                PipelineConfig(
+                    encounter,
+                    detector_model,
+                    identifier_model,
+                    threshold=0.5,
+                    detector_classes=CLASSES,
+                    selected_class_ids=(2, 3),
+                ),
+                runtime=Detector(
+                    {
+                        "saddles.jpg": [
+                            detection(2, 0.9),
+                            detection(3, 0.8),
+                        ]
+                    }
+                ),
+                identifier_runtime=identifier,
+                probe=lambda: (True, "ready"),
+            )
+
+            self.assertTrue(summary.completed)
+            report_text = (encounter / report_filename(encounter)).read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("Destination: FinSaddle", report_text)
+            self.assertIn("<strong>Candidates:</strong>", report_text)
+            for identity in ("NKW-101", "NKW-102", "NKW-103"):
+                self.assertIn(
+                    f'<span style="color:#0369a1;font-weight:700">{identity}</span>',
+                    report_text,
+                )
+            for identity in ("NKW-201", "NKW-202", "NKW-203"):
+                self.assertIn(
+                    f'<span style="color:#b45309;font-weight:700">{identity}</span>',
+                    report_text,
+                )
+            self.assertNotIn("NKW-204", report_text)
+
+    def test_burst_eye_inherits_all_identities_and_left_wins(self) -> None:
+        detector_model, identifier_model = models()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            encounter = source / "2026-04-06 Burst IDs"
+            camera = encounter / "Camera A"
+            captured = datetime(2026, 4, 6, 12, 0, 0)
+            names = (
+                "a-left-saddle.jpg",
+                "b-right-saddle.jpg",
+                "c-left-saddle.jpg",
+                "d-right-eye.jpg",
+            )
+            for index, name in enumerate(names):
+                save_jpeg_at(camera / name, captured + timedelta(milliseconds=400 * index))
+            output = Path(temporary) / "output"
+            boxes = {
+                "a-left-saddle.jpg": [detection(2)],
+                "b-right-saddle.jpg": [detection(3)],
+                "c-left-saddle.jpg": [detection(2)],
+                "d-right-eye.jpg": [detection(5)],
+            }
+            identifier = Identifier(
+                [0.7, 0.8, 0.95],
+                ["NKW-001", "NKW-002", "NKW-001"],
+            )
+
+            summary = run_pipeline(
+                PipelineConfig(
+                    source,
+                    detector_model,
+                    identifier_model,
+                    clustering=True,
+                    output_root=output,
+                    detector_classes=CLASSES,
+                    selected_class_ids=(2, 3),
+                ),
+                runtime=Detector(boxes),
+                identifier_runtime=identifier,
+                probe=lambda: (True, "ready"),
+            )
+
+            target = output / encounter.name
+            linked = target / "LEFT/IDed/NKW-001_NKW-002_EYE_d-right-eye.jpg"
+            self.assertTrue(summary.completed)
+            self.assertTrue(linked.is_file())
+            self.assertFalse((target / "RIGHT/Eyes/d-right-eye.jpg").exists())
+            report_text = (target / report_filename(encounter)).read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("NKW-001 0.950", report_text)
+            self.assertIn("NKW-002 0.800", report_text)
+            self.assertIn("2 orcas total · 4 images", report_text)
+
+    def test_burst_boundaries_use_chained_exif_times_and_source_folder(self) -> None:
+        detector_model, identifier_model = models()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            encounter = source / "2026-04-07 Burst Boundaries"
+            camera_a = encounter / "Camera A"
+            camera_b = encounter / "Camera B"
+            captured = datetime(2026, 4, 7, 12, 0, 0)
+            timed = {
+                "a-saddle.jpg": captured,
+                "b-exact.jpg": captured + timedelta(seconds=2),
+                "c-chained.jpg": captured + timedelta(seconds=4),
+                "d-outside.jpg": captured + timedelta(seconds=6, milliseconds=1),
+            }
+            for name, capture_time in timed.items():
+                save_jpeg_at(camera_a / name, capture_time)
+            save_jpeg(camera_a / "e-missing.jpg")
+            save_jpeg_at(camera_b / "f-other-camera.jpg", captured + timedelta(seconds=1))
+            output = Path(temporary) / "output"
+            boxes = {
+                "a-saddle.jpg": [detection(2)],
+                "b-exact.jpg": [detection(4)],
+                "c-chained.jpg": [detection(4)],
+                "d-outside.jpg": [detection(4)],
+                "e-missing.jpg": [detection(4)],
+                "f-other-camera.jpg": [detection(4)],
+            }
+
+            summary = run_pipeline(
+                PipelineConfig(
+                    source,
+                    detector_model,
+                    identifier_model,
+                    clustering=True,
+                    output_root=output,
+                    detector_classes=CLASSES,
+                    selected_class_ids=(2,),
+                ),
+                runtime=Detector(boxes),
+                identifier_runtime=Identifier([0.9]),
+                probe=lambda: (True, "ready"),
+            )
+
+            target = output / encounter.name
+            self.assertTrue(summary.completed)
+            self.assertTrue((target / "LEFT/IDed/NKW-001_EYE_b-exact.jpg").is_file())
+            self.assertTrue((target / "LEFT/IDed/NKW-001_EYE_c-chained.jpg").is_file())
+            self.assertTrue((target / "LEFT/Eyes/d-outside.jpg").is_file())
+            self.assertTrue((target / "LEFT/Eyes/e-missing.jpg").is_file())
+            self.assertTrue((target / "LEFT/Eyes/f-other-camera.jpg").is_file())
+
+    def test_identified_saddle_wins_and_supplies_right_destination(self) -> None:
+        detector_model, identifier_model = models()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            encounter = source / "2026-04-07 Right Burst"
+            camera = encounter / "Camera A"
+            captured = datetime(2026, 4, 7, 13, 0, 0)
+            for index, name in enumerate(
+                (
+                    "a-left-unidentified.jpg",
+                    "b-right-identified.jpg",
+                    "c-left-eye.jpg",
+                    "d-low-eye.jpg",
+                )
+            ):
+                save_jpeg_at(camera / name, captured + timedelta(milliseconds=index * 400))
+            output = Path(temporary) / "output"
+            boxes = {
+                "a-left-unidentified.jpg": [detection(2)],
+                "b-right-identified.jpg": [detection(3)],
+                "c-left-eye.jpg": [detection(4)],
+                "d-low-eye.jpg": [detection(4, 0.2)],
+            }
+
+            summary = run_pipeline(
+                PipelineConfig(
+                    source,
+                    detector_model,
+                    identifier_model,
+                    threshold=0.5,
+                    eye_confidence=0.5,
+                    clustering=True,
+                    output_root=output,
+                    detector_classes=CLASSES,
+                    selected_class_ids=(2, 3),
+                ),
+                runtime=Detector(boxes),
+                identifier_runtime=Identifier([0.1, 0.9]),
+                probe=lambda: (True, "ready"),
+            )
+
+            target = output / encounter.name
+            self.assertTrue(summary.completed)
+            self.assertTrue((target / "RIGHT/IDed/NKW-002_EYE_c-left-eye.jpg").is_file())
+            self.assertTrue((target / "Rest/d-low-eye.jpg").is_file())
+
+    def test_disabled_right_policy_keeps_right_eyes_but_links_left_eyes(self) -> None:
+        detector_model, identifier_model = models()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            encounter = source / "2026-04-08 Right Policy"
+            captured = datetime(2026, 4, 8, 12, 0, 0)
+            camera_a = encounter / "Camera A"
+            camera_b = encounter / "Camera B"
+            for index, name in enumerate(
+                ("a-right-saddle.jpg", "b-left-eye.jpg", "c-right-eye.jpg")
+            ):
+                save_jpeg_at(camera_a / name, captured + timedelta(milliseconds=index * 500))
+            for index, name in enumerate(
+                ("d-left-saddle.jpg", "e-left-eye.jpg", "f-right-eye.jpg")
+            ):
+                save_jpeg_at(camera_b / name, captured + timedelta(milliseconds=index * 500))
+            output = Path(temporary) / "output"
+            boxes = {
+                "a-right-saddle.jpg": [detection(3)],
+                "b-left-eye.jpg": [detection(4)],
+                "c-right-eye.jpg": [detection(5)],
+                "d-left-saddle.jpg": [detection(2)],
+                "e-left-eye.jpg": [detection(4)],
+                "f-right-eye.jpg": [detection(5)],
+            }
+
+            summary = run_pipeline(
+                PipelineConfig(
+                    source,
+                    detector_model,
+                    identifier_model,
+                    exclude_right_identification=True,
+                    clustering=True,
+                    output_root=output,
+                    detector_classes=CLASSES,
+                    selected_class_ids=(2, 3),
+                ),
+                runtime=Detector(boxes),
+                identifier_runtime=Identifier([0.9]),
+                probe=lambda: (True, "ready"),
+            )
+
+            target = output / encounter.name
+            self.assertTrue(summary.completed)
+            self.assertFalse((target / "RIGHT/IDed").exists())
+            self.assertTrue((target / "RIGHT/FinSaddle/b-left-eye.jpg").is_file())
+            self.assertTrue((target / "RIGHT/Eyes/c-right-eye.jpg").is_file())
+            self.assertTrue((target / "LEFT/IDed/NKW-001_EYE_e-left-eye.jpg").is_file())
+            self.assertTrue((target / "RIGHT/Eyes/f-right-eye.jpg").is_file())
+
+    def test_disabled_only_right_candidates_do_not_load_identifier(self) -> None:
+        detector_model, identifier_model = models()
+        with tempfile.TemporaryDirectory() as temporary:
+            encounter = Path(temporary) / "2026-04-09 Right Only"
+            save_jpeg_at(
+                encounter / "right-saddle.jpg",
+                datetime(2026, 4, 9, 12, 0, 0),
+            )
+            config = PipelineConfig(
+                encounter,
+                detector_model,
+                identifier_model,
+                exclude_right_identification=True,
+                detector_classes=CLASSES,
+                selected_class_ids=(3,),
+            )
+
+            with patch(
+                "finid.pipeline.IdentifierRuntime",
+                side_effect=AssertionError("identifier should not load"),
+            ):
+                summary = run_pipeline(
+                    config,
+                    runtime=Detector({"right-saddle.jpg": [detection(3)]}),
+                    probe=lambda: (True, "ready"),
+                )
+
+            self.assertTrue(summary.completed)
+            self.assertIsNone(summary.error)
 
     def test_undated_skip_duplicate_names_and_managed_rerun(self) -> None:
         detector_model, identifier_model = models()
@@ -575,8 +962,22 @@ class ClusteringTests(unittest.TestCase):
                         detector_classes=CLASSES,
                         selected_class_ids=(2,),
                     ),
-                    runtime=Detector({}),
-                    identifier_runtime=Identifier([]),
+                    runtime=Detector(
+                        {
+                            "0.jpg": [detection(2)],
+                            "1.jpg": [detection(2)],
+                        }
+                    ),
+                    identifier_runtime=RankedIdentifier(
+                        [
+                            ranked_prediction(
+                                (("NKW-001", 0.9), ("NKW-002", 0.8), ("NKW-003", 0.7))
+                            ),
+                            ranked_prediction(
+                                (("NKW-101", 0.4), ("NKW-102", 0.3), ("NKW-103", 0.2))
+                            ),
+                        ]
+                    ),
                     probe=lambda: (True, "ready"),
                 )
 
@@ -587,6 +988,17 @@ class ClusteringTests(unittest.TestCase):
             self.assertIn("FINID_SECTIONS", text)
             self.assertIn('type="application/json" id="finid-page-', text)
             self.assertIn('"pages":["finid-page-', text)
+            self.assertIn(
+                '"identities":[["NKW-001",0.9,"probability","#0369a1"]]',
+                text,
+            )
+            self.assertIn(
+                '"candidates":[["NKW-101",0.4,"probability","#0369a1"],'
+                '["NKW-102",0.3,"probability","#0369a1"],'
+                '["NKW-103",0.2,"probability","#0369a1"]]',
+                text,
+            )
+            self.assertIn("if(value[3])identity.style.cssText", text)
             self.assertFalse(assets.exists())
 
     def test_report_removes_legacy_managed_asset_directory(self) -> None:

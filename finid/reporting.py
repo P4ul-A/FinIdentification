@@ -63,8 +63,25 @@ class ReportMetadata:
     message: str = ""
 
 
-def _header(handle: object, encounter: Path, metadata: ReportMetadata, counts: dict[str, int]) -> None:
-    """Write report header and encounter totals."""
+def _header(
+    handle: object,
+    encounter: Path,
+    metadata: ReportMetadata,
+    counts: dict[str, int],
+    identity_count: int,
+) -> None:
+    """Write report header and encounter totals.
+
+    Parameters:
+        handle: Open report output stream.
+        encounter: Source encounter represented by the report.
+        metadata: Run metadata displayed above the summary.
+        counts: Image counts by cluster category.
+        identity_count: Distinct accepted orcas among IDed images.
+
+    Returns:
+        None.
+    """
     title = f"Fin identifications — {encounter.name}"
     status = "Complete" if metadata.completed else "Partial"
     status_class = "complete" if metadata.completed else "partial"
@@ -75,7 +92,7 @@ def _header(handle: object, encounter: Path, metadata: ReportMetadata, counts: d
 *{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}
 main{{max-width:1280px;margin:auto;padding:30px 20px 60px}}h1{{margin:.2rem 0}}h2{{margin-top:2rem}}h3{{margin-top:1.5rem}}
 .muted{{color:var(--muted)}}.status{{display:inline-block;padding:.3rem .7rem;border-radius:999px;font-weight:700}}.complete{{background:#dcfce7;color:var(--green)}}.partial{{background:#ffedd5;color:var(--amber)}}
-.summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:20px 0}}.metric,.card,.notice{{background:#fff;border:1px solid var(--line);border-radius:12px}}.metric{{padding:14px}}.metric strong{{display:block;font-size:1.5rem}}
+.summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:20px 0}}.metric,.card,.notice{{background:#fff;border:1px solid var(--line);border-radius:12px}}.metric{{padding:14px}}.metric strong{{display:block;font-size:1.5rem}}.metric small{{display:block;color:var(--muted);margin-top:2px}}
 .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:15px}}.compact{{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}}.card{{overflow:hidden}}.image-wrap{{display:block;position:relative;background:#e8eef6}}.card img{{display:block;width:100%;height:auto}}.body{{padding:12px}}.box{{position:absolute;border:3px solid var(--box-color);box-shadow:0 2px 7px #0008;pointer-events:none}}.detail{{border-top:1px solid var(--line);padding-top:7px;margin-top:7px}}.notice{{padding:14px}}code{{overflow-wrap:anywhere}}a{{color:var(--blue)}}
 .pager{{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:18px 0}}.pager select,.pager button{{font:inherit;padding:8px 10px}}.pager button:disabled{{opacity:.45}}
 </style></head><body><main><div style="color:var(--blue);font-weight:700">Fin Identification Report</div>
@@ -85,13 +102,24 @@ main{{max-width:1280px;margin:auto;padding:30px 20px 60px}}h1{{margin:.2rem 0}}h
         handle.write(
             '<div class="notice"><strong>RIGHT-side identification disabled:'
             "</strong> RIGHT FinSaddle crops were not sent for identification. "
-            "RIGHT FinSaddle and eye detections were still classified.</div>"
+            "RIGHT FinSaddle and eye detections were still classified, but "
+            "RIGHT eye images were not linked to camera-burst saddle results.</div>"
         )
     if metadata.message:
         handle.write(f'<div class="notice">{html.escape(metadata.message)}</div>')
     handle.write('<section class="summary">')
+    orca_label = "orca" if identity_count == 1 else "orcas"
+    image_label = "image" if counts["IDed"] == 1 else "images"
     for label in ("Total", "IDed", "FinSaddle", "Eyes", "Rest", "Failures"):
-        handle.write(f'<div class="metric"><strong>{counts[label]}</strong>{label}</div>')
+        detail = (
+            f'<small>{identity_count} {orca_label} total · '
+            f'{counts["IDed"]} {image_label}</small>'
+            if label == "IDed"
+            else ""
+        )
+        handle.write(
+            f'<div class="metric"><strong>{counts[label]}</strong>{label}{detail}</div>'
+        )
     handle.write("</section>")
 
 
@@ -109,7 +137,7 @@ def _image_href(row: object, report_root: Path) -> str:
 def _report_details(
     store: ResultStore,
     row: object,
-) -> tuple[list[object], list[object]]:
+) -> tuple[list[object], list[object], list[object]]:
     """Load the report details needed for one image.
 
     Parameters:
@@ -117,8 +145,8 @@ def _report_details(
         row: Source-image database row.
 
     Returns:
-        Accepted identities and raw detections. Identity queries are skipped
-        for categories that cannot contain accepted identities.
+        Accepted identities, rejected candidates, and raw detections. Ranked
+        candidate queries are limited to FinSaddle cards.
     """
     image_id = int(row["id"])
     identities = (
@@ -126,7 +154,52 @@ def _report_details(
         if row["cluster_category"] == "IDed"
         else []
     )
-    return identities, list(store.detections(image_id))
+    candidates = (
+        list(store.identity_candidates(image_id))
+        if row["cluster_category"] == "FinSaddle"
+        else []
+    )
+    return identities, candidates, list(store.detections(image_id))
+
+
+def _detection_colors(detections: Iterable[object]) -> dict[int, str]:
+    """Map stored detection IDs to their report overlay colors.
+
+    Parameters:
+        detections: Detections in the same order used to draw overlays.
+
+    Returns:
+        Detection database IDs mapped to their corresponding box colors.
+    """
+    return {
+        int(detection["id"]): BOX_COLORS[index % len(BOX_COLORS)]
+        for index, detection in enumerate(detections)
+    }
+
+
+def _identity_html(identity: object, detection_colors: dict[int, str]) -> str:
+    """Render one identity with its associated detection-box color.
+
+    Parameters:
+        identity: Stored identity row, optionally linked to a detection.
+        detection_colors: Detection IDs mapped to report colors.
+
+    Returns:
+        Escaped identity details with a colored identity label when associated.
+    """
+    label = html.escape(str(identity["identity"]))
+    detection_id = identity["detection_id"]
+    color = (
+        detection_colors.get(int(detection_id))
+        if detection_id is not None
+        else None
+    )
+    if color is not None:
+        label = f'<span style="color:{color};font-weight:700">{label}</span>'
+    return (
+        f'{label} {float(identity["score"]):.3f} '
+        f'{html.escape(str(identity["score_type"]))}'
+    )
 
 
 def _card(
@@ -137,7 +210,7 @@ def _card(
     advance: Callable[[], None] | None = None,
 ) -> None:
     """Write one image card with assignment, scores, and overlays."""
-    identities, detections = _report_details(store, row)
+    identities, candidates, detections = _report_details(store, row)
     href = _image_href(row, report_root)
     width = height = 0
     if detections:
@@ -157,8 +230,14 @@ def _card(
     shown_name = str(row["copied_filename"] or row["filename"])
     handle.write(f'</a><div class="body"><strong>{html.escape(shown_name)}</strong><div class="muted">Original: <code>{html.escape(str(row["relative_path"]))}</code></div><div>Destination: {html.escape(str(row["cluster_category"]))} · Side: {html.escape(str(row["cluster_side"] or "—"))}</div>')
     if identities:
+        detection_colors = _detection_colors(detections)
         handle.write('<div class="detail"><strong>Identities:</strong> ' + " · ".join(
-            f'{html.escape(str(item["identity"]))} {float(item["score"]):.3f} {html.escape(str(item["score_type"]))}' for item in identities
+            _identity_html(item, detection_colors) for item in identities
+        ) + "</div>")
+    if candidates:
+        detection_colors = _detection_colors(detections)
+        handle.write('<div class="detail"><strong>Candidates:</strong> ' + " · ".join(
+            _identity_html(item, detection_colors) for item in candidates
         ) + "</div>")
     if detections:
         labels = []
@@ -238,7 +317,8 @@ def _virtual_card_data(
     Returns:
         JSON-compatible card content, including colored detection overlays.
     """
-    identities, detections = _report_details(store, row)
+    identities, candidates, detections = _report_details(store, row)
+    detection_colors = _detection_colors(detections)
     href = _image_href(row, report_root)
     dimensions = _image_dimensions(Path(str(row["path"])))
     overlays: list[dict[str, object]] = []
@@ -266,8 +346,24 @@ def _virtual_card_data(
         "category": str(row["cluster_category"]),
         "side": str(row["cluster_side"] or "—"),
         "identities": [
-            [str(item["identity"]), float(item["score"]), str(item["score_type"])]
+            [
+                str(item["identity"]),
+                float(item["score"]),
+                str(item["score_type"]),
+                detection_colors.get(int(item["detection_id"]))
+                if item["detection_id"] is not None
+                else None,
+            ]
             for item in identities
+        ],
+        "candidates": [
+            [
+                str(item["identity"]),
+                float(item["score"]),
+                str(item["score_type"]),
+                detection_colors.get(int(item["detection_id"])),
+            ]
+            for item in candidates
         ],
         "detections": [
             [
@@ -387,7 +483,8 @@ def _write_virtual_body(
         r''';
 const sectionSelect=document.getElementById("finid-section"),cards=document.getElementById("finid-cards"),pageLabel=document.getElementById("finid-page"),loading=document.getElementById("finid-loading"),previous=document.getElementById("finid-prev"),next=document.getElementById("finid-next");let sectionIndex=0,pageIndex=0;
 function node(tag,text,cls){const value=document.createElement(tag);if(text!==undefined)value.textContent=text;if(cls)value.className=cls;return value}
-function render(items){cards.replaceChildren();for(const item of items){const card=node("article",undefined,"card"),link=node("a",undefined,"image-wrap"),image=node("img");link.href=item.href;image.src=item.src;image.alt=item.filename;image.loading="lazy";link.append(image);for(const box of item.overlays){const overlay=node("span",undefined,"box");overlay.style.cssText=`left:${box.left}%;top:${box.top}%;width:${box.width}%;height:${box.height}%;--box-color:${box.color}`;link.append(overlay)}card.append(link);const body=node("div",undefined,"body");body.append(node("strong",item.filename),node("div",`Original: ${item.relative_path}`,"muted"),node("div",`Destination: ${item.category} · Side: ${item.side}`));if(item.identities.length)body.append(node("div",`Identities: ${item.identities.map(value=>`${value[0]} ${value[1].toFixed(3)} ${value[2]}`).join(" · ")}`,"detail"));if(item.detections.length){const detail=node("div",undefined,"detail");detail.append(node("strong","Detections: "));item.detections.forEach((value,index)=>{if(index)detail.append(" · ");detail.append(`${value[0]} `);const score=node("span",value[1].toFixed(3));score.style.cssText=`color:${value[2]};font-weight:700`;detail.append(score)});body.append(detail)}if(item.failure)body.append(node("div",`Problem: ${item.failure}`,"detail"));card.append(body);cards.append(card)}loading.hidden=true}
+function renderRanked(body,label,items){if(!items.length)return;const detail=node("div",undefined,"detail");detail.append(node("strong",`${label}: `));items.forEach((value,index)=>{if(index)detail.append(" · ");const identity=node("span",value[0]);if(value[3])identity.style.cssText=`color:${value[3]};font-weight:700`;detail.append(identity,` ${value[1].toFixed(3)} ${value[2]}`)});body.append(detail)}
+function render(items){cards.replaceChildren();for(const item of items){const card=node("article",undefined,"card"),link=node("a",undefined,"image-wrap"),image=node("img");link.href=item.href;image.src=item.src;image.alt=item.filename;image.loading="lazy";link.append(image);for(const box of item.overlays){const overlay=node("span",undefined,"box");overlay.style.cssText=`left:${box.left}%;top:${box.top}%;width:${box.width}%;height:${box.height}%;--box-color:${box.color}`;link.append(overlay)}card.append(link);const body=node("div",undefined,"body");body.append(node("strong",item.filename),node("div",`Original: ${item.relative_path}`,"muted"),node("div",`Destination: ${item.category} · Side: ${item.side}`));renderRanked(body,"Identities",item.identities);renderRanked(body,"Candidates",item.candidates);if(item.detections.length){const detail=node("div",undefined,"detail");detail.append(node("strong","Detections: "));item.detections.forEach((value,index)=>{if(index)detail.append(" · ");detail.append(`${value[0]} `);const score=node("span",value[1].toFixed(3));score.style.cssText=`color:${value[2]};font-weight:700`;detail.append(score)});body.append(detail)}if(item.failure)body.append(node("div",`Problem: ${item.failure}`,"detail"));card.append(body);cards.append(card)}loading.hidden=true}
 function load(){const section=FINID_SECTIONS[sectionIndex],pageCount=section.pages.length;previous.disabled=pageIndex===0;next.disabled=pageIndex>=pageCount-1;pageLabel.textContent=pageCount?`Page ${pageIndex+1} of ${pageCount} · ${section.count} images`:`No images`;if(!pageCount){cards.replaceChildren();loading.textContent="No images in this category.";loading.hidden=false;return}render(JSON.parse(document.getElementById(section.pages[pageIndex]).textContent))}
 FINID_SECTIONS.forEach((section,index)=>{const option=node("option",`${section.title} (${section.count})`);option.value=index;sectionSelect.append(option)});sectionSelect.onchange=()=>{sectionIndex=Number(sectionSelect.value);pageIndex=0;load()};previous.onclick=()=>{if(pageIndex){pageIndex--;load()}};next.onclick=()=>{if(pageIndex+1<FINID_SECTIONS[sectionIndex].pages.length){pageIndex++;load()}};load();
 </script>'''
@@ -432,6 +529,7 @@ def write_reports(
         report_root = Path(str(encounter_row["output_path"] or encounter))
         report_root.mkdir(parents=True, exist_ok=True)
         counts = store.encounter_counts(encounter)
+        identity_count = store.encounter_identity_count(encounter)
         report_path = report_root / report_filename(encounter)
         assets_name = _asset_directory_name(encounter)
         assets_path = report_root / assets_name
@@ -448,7 +546,7 @@ def write_reports(
             handle = os.fdopen(descriptor, "w", encoding="utf-8")
             descriptor = None
             with handle:
-                _header(handle, encounter, metadata, counts)
+                _header(handle, encounter, metadata, counts, identity_count)
                 if virtualized:
                     _write_virtual_body(
                         handle,

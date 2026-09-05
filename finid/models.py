@@ -30,12 +30,22 @@ class IdentificationModel:
 
 
 @dataclass(frozen=True, slots=True)
-class IdentityPrediction:
-    """Store one identity score returned for a fin crop."""
+class IdentityCandidate:
+    """Store one ranked identity candidate for a fin crop."""
 
     identity: str
     score: float
     score_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityPrediction:
+    """Store the best identity and ranked candidates for a fin crop."""
+
+    identity: str
+    score: float
+    score_type: str
+    candidates: tuple[IdentityCandidate, ...] = ()
 
 
 def _friendly_name(path: Path, prefix: str = "") -> str:
@@ -403,26 +413,46 @@ class IdentifierRuntime:
         return predictions
 
     def _predict_attempt(self, crops: Sequence[Any]) -> list[IdentityPrediction]:
+        """Return the three highest-scoring identities for each crop.
+
+        Parameters:
+            crops: FinSaddle crops in one bounded inference attempt.
+
+        Returns:
+            One best prediction per crop, carrying up to three ranked candidates.
+        """
         tensors = [self.transform(crop) for crop in crops]
         batch = self.torch.stack(tensors).to(self.device, dtype=self.dtype)
         with self.torch.inference_mode():
             values = self.model(batch)
             if self.descriptor.kind == "resnet":
-                scores, indexes = values.softmax(dim=1).max(dim=1)
+                candidate_scores = values.softmax(dim=1)
             else:
-                similarities = values @ self.prototypes.T
-                scores, indexes = similarities.max(dim=1)
+                candidate_scores = values @ self.prototypes.T
+            candidate_count = min(3, len(self.identities))
+            scores, indexes = candidate_scores.topk(candidate_count, dim=1)
         scores = scores.float().cpu()
         indexes = indexes.cpu()
-        output = [
-            IdentityPrediction(
-                identity=self.identities[int(index)],
-                score=float(score),
-                score_type=self.descriptor.score_label,
+        output: list[IdentityPrediction] = []
+        for crop_scores, crop_indexes in zip(scores, indexes):
+            candidates = tuple(
+                IdentityCandidate(
+                    identity=self.identities[int(index)],
+                    score=float(score),
+                    score_type=self.descriptor.score_label,
+                )
+                for score, index in zip(crop_scores, crop_indexes)
             )
-            for score, index in zip(scores, indexes)
-        ]
-        del batch, values, scores, indexes, tensors
+            best = candidates[0]
+            output.append(
+                IdentityPrediction(
+                    identity=best.identity,
+                    score=best.score,
+                    score_type=best.score_type,
+                    candidates=candidates,
+                )
+            )
+        del batch, values, candidate_scores, scores, indexes, tensors
         return output
 
     def _empty_cache(self) -> None:

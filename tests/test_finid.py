@@ -158,6 +158,35 @@ class BatchRecommendationTests(unittest.TestCase):
         with self.assertRaisesRegex(IdentifierOutOfMemory, "batch size 1"):
             runtime.predict([object()])
 
+    def test_identifier_returns_top_three_ranked_candidates(self) -> None:
+        runtime = IdentifierRuntime.__new__(IdentifierRuntime)
+        runtime.torch = torch
+        runtime.device = torch.device("cpu")
+        runtime.precision = "FP32"
+        runtime.identities = ["NKW-A", "NKW-B", "NKW-C", "NKW-D"]
+        runtime.descriptor = IdentificationModel(
+            "Classifier",
+            Path("classifier.pt"),
+            "resnet",
+            "probability",
+        )
+        runtime.prototypes = None
+        runtime.transform = lambda crop: torch.tensor(crop, dtype=torch.float32)
+        runtime.model = lambda batch: batch
+
+        predictions = runtime._predict_attempt(
+            [[1.0, 4.0, 3.0, 2.0], [4.0, 1.0, 2.0, 3.0]]
+        )
+
+        self.assertEqual(
+            [[item.identity for item in prediction.candidates] for prediction in predictions],
+            [["NKW-B", "NKW-C", "NKW-D"], ["NKW-A", "NKW-D", "NKW-C"]],
+        )
+        self.assertEqual(
+            [prediction.identity for prediction in predictions],
+            ["NKW-B", "NKW-A"],
+        )
+
 
 class AppInputTests(unittest.TestCase):
     def test_run_boundary_log_messages_include_times_and_outcome(self) -> None:
@@ -482,9 +511,19 @@ class InventoryAndReportTests(unittest.TestCase):
             self.assertIn("NKW-002", text)
             self.assertIn("orca%20one.jpg", text)
             self.assertIn("Original:", text)
+            self.assertIn("2 orcas total · 1 image", text)
             self.assertEqual(text.count('class="box"'), 2)
             self.assertIn("--box-color:#0369a1", text)
             self.assertIn("--box-color:#b45309", text)
+            self.assertIn(
+                '<span style="color:#0369a1;font-weight:700">'
+                "NKW-001 &amp; friend</span>",
+                text,
+            )
+            self.assertIn(
+                '<span style="color:#b45309;font-weight:700">NKW-002</span>',
+                text,
+            )
             self.assertNotIn("box (1, 2)", text)
             self.assertNotIn("Detection 88.0%", text)
             self.assertNotIn("0 0 0 1px", text)

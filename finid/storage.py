@@ -6,7 +6,9 @@ import os
 import sqlite3
 import tempfile
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, Sequence
+
+from .sides import winning_side
 
 
 def _path_key(path: Path) -> str:
@@ -59,11 +61,13 @@ class ResultStore:
             );
             CREATE TABLE source_images (
                 id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL,
-                encounter_path TEXT NOT NULL, relative_path TEXT NOT NULL,
+                encounter_path TEXT NOT NULL, source_directory TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
                 filename TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
                 cluster_category TEXT, cluster_side TEXT, copied_filename TEXT,
                 failure_message TEXT, primary_identity TEXT,
-                primary_identity_score REAL
+                primary_identity_score REAL, capture_time_us INTEGER,
+                burst_id INTEGER
             );
             CREATE INDEX source_images_pending ON source_images(
                 state, path COLLATE NOCASE, path
@@ -78,6 +82,9 @@ class ResultStore:
             CREATE INDEX source_images_identity_order ON source_images(
                 encounter_path, primary_identity,
                 relative_path COLLATE NOCASE, relative_path
+            );
+            CREATE INDEX source_images_burst ON source_images(
+                burst_id, cluster_category, cluster_side
             );
             CREATE TABLE detections (
                 id INTEGER PRIMARY KEY, image_id INTEGER NOT NULL,
@@ -95,6 +102,15 @@ class ResultStore:
             CREATE INDEX identities_image ON identities(image_id);
             CREATE INDEX identities_ranked ON identities(
                 image_id, score DESC, identity
+            );
+            CREATE TABLE identity_candidates (
+                id INTEGER PRIMARY KEY, image_id INTEGER NOT NULL,
+                detection_id INTEGER NOT NULL, identity TEXT NOT NULL,
+                score REAL NOT NULL, score_type TEXT NOT NULL,
+                rank INTEGER NOT NULL, UNIQUE(detection_id, rank)
+            );
+            CREATE INDEX identity_candidates_image ON identity_candidates(
+                image_id, detection_id, rank
             );
             CREATE TABLE skipped_undated (path TEXT PRIMARY KEY);
             """
@@ -211,9 +227,10 @@ class ResultStore:
         encounter_text = _path_key(encounter)
         relative_path = Path(path_text).relative_to(Path(encounter_text)).as_posix()
         self.connection.execute(
-            """INSERT INTO source_images(path, encounter_path, relative_path, filename)
-               VALUES (?, ?, ?, ?)""",
-            (path_text, encounter_text, relative_path, path.name),
+            """INSERT INTO source_images(
+                   path, encounter_path, source_directory, relative_path, filename)
+               VALUES (?, ?, ?, ?, ?)""",
+            (path_text, encounter_text, str(path.parent), relative_path, path.name),
         )
         self.connection.execute(
             "UPDATE encounters SET image_count = image_count + 1 WHERE path = ?",
@@ -263,8 +280,23 @@ class ResultStore:
     def record_result(
         self, image_path: Path, detections: Iterable[dict[str, object]],
         identities: Iterable[dict[str, object]], category: str, side: str | None,
+        capture_time_us: int | None = None,
+        identity_candidates: Iterable[dict[str, object]] = (),
     ) -> None:
-        """Persist detections, identities, and the image's single assignment."""
+        """Persist detections, identities, capture time, and one assignment.
+
+        Parameters:
+            image_path: Inventoried source image path.
+            detections: Normalized detector results for the image.
+            identities: Accepted direct identification results.
+            category: Independently selected cluster category.
+            side: Independently selected cluster side.
+            capture_time_us: EXIF capture time as naive ordinal microseconds.
+            identity_candidates: Up to three ranked candidates per FinSaddle crop.
+
+        Returns:
+            None.
+        """
         image_id = self._image_id(image_path)
         if image_id is None:
             raise KeyError(f"Image was not inventoried: {image_path}")
@@ -292,7 +324,24 @@ class ResultStore:
                 """INSERT INTO identities(image_id, detection_id, identity, score, score_type)
                    VALUES (?, ?, ?, ?, ?)""",
                 (image_id, detection_id, str(identity["identity"]),
-                 float(identity["score"]), str(identity["score_type"])),
+                float(identity["score"]), str(identity["score_type"])),
+            )
+        for candidate in identity_candidates:
+            index = int(candidate.get("detection_index", -1))
+            if not 0 <= index < len(detection_ids):
+                continue
+            self.connection.execute(
+                """INSERT INTO identity_candidates(
+                       image_id, detection_id, identity, score, score_type, rank)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    image_id,
+                    detection_ids[index],
+                    str(candidate["identity"]),
+                    float(candidate["score"]),
+                    str(candidate["score_type"]),
+                    int(candidate["rank"]),
+                ),
             )
         primary = min(
             best.values(),
@@ -301,17 +350,154 @@ class ResultStore:
         )
         self.connection.execute(
             """UPDATE source_images SET state = 'processed', cluster_category = ?,
-               cluster_side = ?, primary_identity = ?, primary_identity_score = ?
+               cluster_side = ?, primary_identity = ?, primary_identity_score = ?,
+               capture_time_us = ?
                WHERE id = ?""",
             (
                 category,
                 side,
                 str(primary["identity"]) if primary is not None else None,
                 float(primary["score"]) if primary is not None else None,
+                capture_time_us,
                 image_id,
             ),
         )
         self._commit_periodically()
+
+    def link_burst_eyes(
+        self,
+        max_gap_microseconds: int,
+        eligible_eye_sides: Sequence[str],
+    ) -> int:
+        """Apply saddle outcomes to eligible eye images in capture-time bursts.
+
+        Parameters:
+            max_gap_microseconds: Largest consecutive capture-time gap in a burst.
+            eligible_eye_sides: Eye sides allowed to inherit burst results.
+
+        Returns:
+            Number of eye images reassigned to IDed or FinSaddle.
+        """
+        if max_gap_microseconds < 0:
+            raise ValueError("Burst gap cannot be negative.")
+        allowed_sides = tuple(dict.fromkeys(str(side) for side in eligible_eye_sides))
+        if not allowed_sides:
+            return 0
+
+        self.commit()
+        linked = 0
+        with self.connection:
+            previous_directory: str | None = None
+            previous_time: int | None = None
+            burst_id = 0
+            rows = self.connection.execute(
+                """SELECT id, source_directory, capture_time_us
+                   FROM source_images
+                   WHERE state = 'processed' AND capture_time_us IS NOT NULL
+                   ORDER BY source_directory COLLATE NOCASE, source_directory,
+                            capture_time_us, relative_path COLLATE NOCASE, relative_path"""
+            )
+            for row in rows:
+                directory = str(row["source_directory"])
+                capture_time = int(row["capture_time_us"])
+                if (
+                    directory != previous_directory
+                    or previous_time is None
+                    or capture_time - previous_time > max_gap_microseconds
+                ):
+                    burst_id += 1
+                self.connection.execute(
+                    "UPDATE source_images SET burst_id = ? WHERE id = ?",
+                    (burst_id, int(row["id"])),
+                )
+                previous_directory = directory
+                previous_time = capture_time
+
+            placeholders = ",".join("?" for _side in allowed_sides)
+            burst_rows = self.connection.execute(
+                f"""SELECT DISTINCT eye.burst_id
+                    FROM source_images AS eye
+                    JOIN source_images AS saddle ON saddle.burst_id = eye.burst_id
+                    WHERE eye.cluster_category = 'Eyes'
+                      AND eye.cluster_side IN ({placeholders})
+                      AND saddle.cluster_category IN ('IDed', 'FinSaddle')
+                    ORDER BY eye.burst_id""",
+                allowed_sides,
+            ).fetchall()
+            for burst_row in burst_rows:
+                current_burst = int(burst_row["burst_id"])
+                identity_rows = self.connection.execute(
+                    """SELECT identities.identity, identities.score,
+                              identities.score_type, source_images.cluster_side
+                       FROM identities
+                       JOIN source_images ON source_images.id = identities.image_id
+                       WHERE source_images.burst_id = ?
+                         AND source_images.cluster_category = 'IDed'
+                       ORDER BY identities.score DESC, identities.identity""",
+                    (current_burst,),
+                ).fetchall()
+                if identity_rows:
+                    category = "IDed"
+                    side = winning_side(row["cluster_side"] for row in identity_rows)
+                    best_identities: dict[str, sqlite3.Row] = {}
+                    for identity_row in identity_rows:
+                        identity = str(identity_row["identity"])
+                        existing = best_identities.get(identity)
+                        if existing is None or float(identity_row["score"]) > float(
+                            existing["score"]
+                        ):
+                            best_identities[identity] = identity_row
+                else:
+                    category = "FinSaddle"
+                    side_rows = self.connection.execute(
+                        """SELECT cluster_side FROM source_images
+                           WHERE burst_id = ? AND cluster_category = 'FinSaddle'""",
+                        (current_burst,),
+                    ).fetchall()
+                    side = winning_side(row["cluster_side"] for row in side_rows)
+                    best_identities = {}
+
+                eye_rows = self.connection.execute(
+                    f"""SELECT id FROM source_images
+                        WHERE burst_id = ? AND cluster_category = 'Eyes'
+                          AND cluster_side IN ({placeholders})
+                        ORDER BY relative_path COLLATE NOCASE, relative_path""",
+                    (current_burst, *allowed_sides),
+                ).fetchall()
+                for eye_row in eye_rows:
+                    eye_id = int(eye_row["id"])
+                    for identity_row in best_identities.values():
+                        self.connection.execute(
+                            """INSERT INTO identities(
+                                   image_id, detection_id, identity, score, score_type)
+                               VALUES (?, NULL, ?, ?, ?)""",
+                            (
+                                eye_id,
+                                str(identity_row["identity"]),
+                                float(identity_row["score"]),
+                                str(identity_row["score_type"]),
+                            ),
+                        )
+                    primary = min(
+                        best_identities.values(),
+                        key=lambda row: (-float(row["score"]), str(row["identity"])),
+                        default=None,
+                    )
+                    self.connection.execute(
+                        """UPDATE source_images SET cluster_category = ?,
+                               cluster_side = ?, primary_identity = ?,
+                               primary_identity_score = ? WHERE id = ?""",
+                        (
+                            category,
+                            side,
+                            str(primary["identity"]) if primary is not None else None,
+                            float(primary["score"]) if primary is not None else None,
+                            eye_id,
+                        ),
+                    )
+                    linked += 1
+        self._writes_since_commit = 0
+        return linked
 
     def record_failure(self, image_path: Path, message: str) -> None:
         """Record a failed image as a Rest assignment."""
@@ -399,6 +585,27 @@ class ResultStore:
             counts["Failures"] += int(row["failure_count"] or 0)
         return counts
 
+    def encounter_identity_count(self, encounter: Path) -> int:
+        """Return distinct accepted orcas represented by IDed images.
+
+        Parameters:
+            encounter: Source encounter root.
+
+        Returns:
+            Number of distinct accepted identities, including secondary and
+            burst-inherited identities.
+        """
+        return int(
+            self.connection.execute(
+                """SELECT COUNT(DISTINCT identities.identity)
+                   FROM identities
+                   JOIN source_images ON source_images.id = identities.image_id
+                   WHERE source_images.encounter_path = ?
+                     AND source_images.cluster_category = 'IDed'""",
+                (_path_key(encounter),),
+            ).fetchone()[0]
+        )
+
     def encounter_failure_count(self, encounter: Path) -> int:
         """Return the number of failed images in an encounter."""
         return int(
@@ -439,6 +646,21 @@ class ResultStore:
         """Yield accepted identities for an image by score."""
         yield from self.connection.execute(
             "SELECT * FROM identities WHERE image_id = ? ORDER BY score DESC, identity", (image_id,)
+        )
+
+    def identity_candidates(self, image_id: int) -> Iterator[sqlite3.Row]:
+        """Yield rejected-match candidates grouped by detection and rank.
+
+        Parameters:
+            image_id: Source-image database ID.
+
+        Returns:
+            Iterator over ranked candidate rows.
+        """
+        yield from self.connection.execute(
+            """SELECT * FROM identity_candidates WHERE image_id = ?
+               ORDER BY detection_id, rank""",
+            (image_id,),
         )
 
     def total_images(self) -> int:

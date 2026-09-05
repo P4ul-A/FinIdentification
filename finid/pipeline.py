@@ -28,6 +28,7 @@ from .reporting import (
     write_reports,
 )
 from .storage import ResultStore
+from .sides import SIDES, identification_enabled, identification_sides, winning_side
 
 
 JPEG_EXTENSIONS = {".jpg", ".jpeg"}
@@ -38,6 +39,9 @@ INPLACE_CLUSTER_SUFFIX = "_clusters"
 LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, int, str], None]
 PROGRESS_SCALE = 1000
+BURST_GAP_MICROSECONDS = 2_000_000
+EXIF_DATETIME_ORIGINAL = 36867
+EXIF_SUBSEC_TIME_ORIGINAL = 37521
 
 
 def _phase_progress(
@@ -501,9 +505,38 @@ def _crop_box(image: Image.Image, values: Sequence[float], padding: float) -> tu
     return image.crop(coordinates), coordinates
 
 
-def _winning_side(sides: Sequence[str | None]) -> str | None:
-    """Choose LEFT on a bilateral conflict, otherwise the qualifying side."""
-    return "LEFT" if "LEFT" in sides else "RIGHT" if "RIGHT" in sides else None
+def _capture_time_us(path: Path) -> int | None:
+    """Read an EXIF capture timestamp as timezone-independent microseconds.
+
+    Parameters:
+        path: JPEG source path whose EXIF header should be inspected.
+
+    Returns:
+        Naive ordinal microseconds, or ``None`` for missing or invalid EXIF.
+    """
+    try:
+        with Image.open(path) as source:
+            exif = source.getexif()
+            raw_datetime = exif.get(EXIF_DATETIME_ORIGINAL)
+            raw_subseconds = exif.get(EXIF_SUBSEC_TIME_ORIGINAL, "")
+        if isinstance(raw_datetime, bytes):
+            raw_datetime = raw_datetime.decode("ascii")
+        if isinstance(raw_subseconds, bytes):
+            raw_subseconds = raw_subseconds.decode("ascii")
+        captured = datetime.strptime(str(raw_datetime), "%Y:%m:%d %H:%M:%S")
+        subsecond_text = str(raw_subseconds).strip()
+        if subsecond_text and not subsecond_text.isdigit():
+            return None
+        microsecond = int((subsecond_text + "000000")[:6]) if subsecond_text else 0
+        seconds = (
+            captured.toordinal() * 86_400
+            + captured.hour * 3_600
+            + captured.minute * 60
+            + captured.second
+        )
+        return seconds * 1_000_000 + microsecond
+    except (OSError, TypeError, ValueError, UnicodeDecodeError):
+        return None
 
 
 @dataclass(slots=True, eq=False)
@@ -513,7 +546,9 @@ class _PreparedImage:
     path: Path
     detections: list[dict[str, object]]
     pending_crops: int
+    capture_time_us: int | None
     identities: list[dict[str, object]] = field(default_factory=list)
+    identity_candidates: list[dict[str, object]] = field(default_factory=list)
 
 
 def _prepare_result(
@@ -522,7 +557,17 @@ def _prepare_result(
     names: dict[int, str],
     selected: set[int],
 ) -> tuple[_PreparedImage, list[tuple[Image.Image, int]]]:
-    """Extract FinSaddle crops without running identification yet."""
+    """Prepare detections, EXIF capture time, and identification crops.
+
+    Parameters:
+        result: Detector result containing a source path, boxes, and image data.
+        config: Active pipeline configuration.
+        names: Detector class IDs mapped to normalized class names.
+        selected: Class IDs selected for identification.
+
+    Returns:
+        Prepared image state and its indexed FinSaddle crops.
+    """
     detections: list[dict[str, object]] = []
     candidate_indices: list[int] = []
     for box in result.boxes:
@@ -534,9 +579,7 @@ def _prepare_result(
         is_candidate = (
             class_id in selected
             and kind == "finsaddle"
-            and not (
-                config.exclude_right_identification and side == "RIGHT"
-            )
+            and identification_enabled(side, config.exclude_right_identification)
             and confidence >= config.detector_confidence
         )
         detections.append(
@@ -574,20 +617,34 @@ def _prepare_result(
             raise
         finally:
             image.close()
-    return _PreparedImage(Path(result.path), detections, len(crops)), crops
+    path = Path(result.path)
+    return _PreparedImage(
+        path,
+        detections,
+        len(crops),
+        _capture_time_us(path),
+    ), crops
 
 
 def _classification(
     state: _PreparedImage,
     config: PipelineConfig,
 ) -> tuple[str, str | None]:
-    """Return the single category and LEFT-preferring side for an image."""
+    """Return the independent category and LEFT-preferring side for an image.
+
+    Parameters:
+        state: Prepared image with completed identification results.
+        config: Active pipeline configuration and confidence thresholds.
+
+    Returns:
+        Cluster category and normalized side selected before burst linking.
+    """
     if state.identities:
         sides = [
             state.detections[int(item["detection_index"])]["side"]
             for item in state.identities
         ]
-        return "IDed", _winning_side(sides)
+        return "IDed", winning_side(sides)
     saddle_sides = [
         item["side"]
         for item in state.detections
@@ -595,7 +652,7 @@ def _classification(
         and float(item["confidence"]) >= config.detector_confidence
     ]
     if saddle_sides:
-        return "FinSaddle", _winning_side(saddle_sides)
+        return "FinSaddle", winning_side(saddle_sides)
     eye_sides = [
         item["side"]
         for item in state.detections
@@ -603,7 +660,7 @@ def _classification(
         and float(item["confidence"]) >= config.eye_confidence
     ]
     if eye_sides:
-        return "Eyes", _winning_side(eye_sides)
+        return "Eyes", winning_side(eye_sides)
     return "Rest", None
 
 
@@ -656,6 +713,18 @@ class _IdentificationBatcher:
                             "score_type": prediction.score_type,
                             "detection_index": detection_index,
                         }
+                    )
+                else:
+                    ranked = prediction.candidates or (prediction,)
+                    state.identity_candidates.extend(
+                        {
+                            "identity": candidate.identity,
+                            "score": candidate.score,
+                            "score_type": candidate.score_type,
+                            "detection_index": detection_index,
+                            "rank": rank,
+                        }
+                        for rank, candidate in enumerate(ranked[:3], start=1)
                     )
                 state.pending_crops -= 1
         finally:
@@ -738,6 +807,28 @@ def _safe_identity(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._") or "Unknown"
 
 
+def _has_qualifying_eye(
+    store: ResultStore,
+    image_id: int,
+    eye_confidence: float,
+) -> bool:
+    """Return whether an image contains an above-threshold eye detection.
+
+    Parameters:
+        store: Disk-backed run results containing image detections.
+        image_id: Source-image database ID.
+        eye_confidence: Minimum detector confidence for a recognized eye.
+
+    Returns:
+        ``True`` when at least one recorded eye detection meets the threshold.
+    """
+    return any(
+        _kind_side(str(detection["class_name"]))[0] == "eye"
+        and float(detection["confidence"]) >= eye_confidence
+        for detection in store.detections(image_id)
+    )
+
+
 def _cluster_to_staging(
     config: PipelineConfig,
     store: ResultStore,
@@ -787,16 +878,16 @@ def _cluster_to_destinations(
     copied = 0
     if progress is not None:
         progress(0, copy_total, "Creating staged encounter folders…")
+    enabled_id_sides = set(
+        identification_sides(config.exclude_right_identification)
+    )
     cluster_directories = [
-        "LEFT/IDed",
-        "LEFT/FinSaddle",
-        "LEFT/Eyes",
-        "RIGHT/FinSaddle",
-        "RIGHT/Eyes",
-        "Rest",
+        f"{side}/{category}"
+        for side in SIDES
+        for category in ("IDed", "FinSaddle", "Eyes")
+        if category != "IDed" or side in enabled_id_sides
     ]
-    if not config.exclude_right_identification:
-        cluster_directories.insert(3, "RIGHT/IDed")
+    cluster_directories.append("Rest")
     for encounter_row in store.encounters():
         encounter = Path(str(encounter_row["path"]))
         encounter_output = destinations[encounter]
@@ -810,13 +901,23 @@ def _cluster_to_destinations(
         for row in store.encounter_images(encounter):
             category = str(row["cluster_category"])
             side = row["cluster_side"]
+            image_id = int(row["id"])
             destination = encounter_output / (Path(str(side)) / category if side else Path(category))
             identities = (
-                list(store.identities(int(row["id"])))
+                list(store.identities(image_id))
                 if category == "IDed"
                 else []
             )
-            prefix = "_".join(_safe_identity(str(item["identity"])) for item in identities)
+            prefix_parts = [
+                _safe_identity(str(item["identity"])) for item in identities
+            ]
+            if category == "IDed" and _has_qualifying_eye(
+                store,
+                image_id,
+                config.eye_confidence,
+            ):
+                prefix_parts.append("EYE")
+            prefix = "_".join(prefix_parts)
             original = str(row["filename"])
             candidate = f"{prefix}_{original}" if prefix else original
             if (destination / candidate).exists():
@@ -824,7 +925,7 @@ def _cluster_to_destinations(
                 source_name = Path(candidate)
                 candidate = f"{source_name.stem}_{source_suffix}{source_name.suffix}"
             shutil.copy2(str(row["path"]), destination / candidate)
-            store.set_copied_filename(int(row["id"]), candidate)
+            store.set_copied_filename(image_id, candidate)
             copied += 1
             if progress is not None and (copied == copy_total or copied % 25 == 0):
                 progress(
@@ -964,7 +1065,8 @@ def run_pipeline(
             emit_log(
                 "RIGHT-side identification is disabled for this run. RIGHT "
                 "FinSaddle and eye detections remain eligible for their "
-                "classification folders."
+                "classification folders, but RIGHT eye images will not inherit "
+                "camera-burst saddle results."
             )
         if skipped_undated:
             examples = ", ".join(str(path) for path in store.skipped_undated_paths(5))
@@ -996,6 +1098,10 @@ def run_pipeline(
             needs_identification = any(
                 class_id in selected_classes
                 and _kind_side(class_name)[0] == "finsaddle"
+                and identification_enabled(
+                    _kind_side(class_name)[1],
+                    config.exclude_right_identification,
+                )
                 for class_id, class_name in class_names.items()
             )
             if active_identifier is None and needs_identification:
@@ -1009,7 +1115,14 @@ def run_pipeline(
             inference_progress(0, total, "Starting detection and identification…")
 
             def record_ready(states: Sequence[_PreparedImage]) -> None:
-                """Persist completed batched states and publish bounded progress."""
+                """Persist completed states and publish bounded progress.
+
+                Parameters:
+                    states: Images whose queued identification crops are complete.
+
+                Returns:
+                    None.
+                """
                 nonlocal processed
                 for state in states:
                     category, side = _classification(state, config)
@@ -1019,6 +1132,8 @@ def run_pipeline(
                         state.identities,
                         category,
                         side,
+                        capture_time_us=state.capture_time_us,
+                        identity_candidates=state.identity_candidates,
                     )
                     processed += 1
                     elapsed = time.monotonic() - inference_started
@@ -1099,6 +1214,23 @@ def run_pipeline(
             synchronize=True,
         )
         _release_runtime(active_identifier, "identifier runtime", emit_log)
+        try:
+            linked_eyes = store.link_burst_eyes(
+                BURST_GAP_MICROSECONDS,
+                identification_sides(config.exclude_right_identification),
+            )
+            if linked_eyes:
+                emit_log(
+                    f"Connected {linked_eyes} eye image(s) to saddle results "
+                    "from the same camera burst."
+                )
+        except Exception as exc:
+            error = (
+                f"{error}; burst-linking error: {exc}"
+                if error
+                else f"Could not link camera bursts: {exc}"
+            )
+            emit_log(f"Could not link camera bursts: {exc}")
         elapsed = time.monotonic() - started
         processed = store.processed_images()
         message = error or ("The run was stopped. Results shown are for completed images only." if stopped else "")
